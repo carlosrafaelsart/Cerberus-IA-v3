@@ -1,0 +1,1070 @@
+name: Build Cerberus APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generar proyecto Cerberus
+        run: |
+          cat > settings.gradle <<'CERBEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Cerberus"
+          include ':app'
+          CERBEOF
+          cat > build.gradle <<'CERBEOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          CERBEOF
+          cat > gradle.properties <<'CERBEOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          CERBEOF
+          mkdir -p app
+          cat > app/build.gradle <<'CERBEOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.carlosart.cerberus'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.carlosart.cerberus'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          CERBEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'CERBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Cerberus"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CerberusService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+
+                  <service
+                      android:name=".CerberusAccess"
+                      android:exported="false"
+                      android:label="Cerberus"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          CERBEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'CERBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/acc_desc" />
+          CERBEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'CERBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="acc_desc">Permite a Cerberus tocar botones, escribir, desplazar la pantalla y enviar mensajes por orden de voz del señor.</string>
+          </resources>
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Actions.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.Manifest
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.BatteryManager
+          import android.os.Build
+          import android.provider.ContactsContract
+          import android.telecom.TelecomManager
+          import java.net.URLEncoder
+          import java.text.Normalizer
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class Actions(private val ctx: Context) {
+
+              companion object {
+                  fun norm(s: String): String {
+                      val d = Normalizer.normalize(s.lowercase(Locale.ROOT), Normalizer.Form.NFD)
+                      return d.replace(Regex("\\p{M}+"), "")
+                          .replace(Regex("[^a-z0-9 ]"), " ")
+                          .replace(Regex("\\s+"), " ")
+                          .trim()
+                  }
+              }
+
+              private fun has(perm: String) = ctx.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+
+              /** Devuelve la respuesta hablada si el comando es local; null si debe responder Gemini. */
+              fun tryHandle(raw: String): String? {
+                  val t = norm(raw)
+                  if (t.isEmpty()) return null
+
+                  if (Regex("quien (te )?(creo|hizo|programo|desarrollo)|tu creador").containsMatchIn(t))
+                      return "Fui creado por CarlosArt, señor."
+
+                  if (t.contains("linterna") || t.contains("flash")) {
+                      val off = Regex("apaga|apagar|desactiva|quita").containsMatchIn(t)
+                      return torch(!off)
+                  }
+
+                  if (Regex("^(si |por favor )?(contesta|contestar|atiende|atender|acepta la llamada|responde la llamada)").containsMatchIn(t))
+                      return answer()
+
+                  if (Regex("^(cuelga|colgar|termina la llamada|finaliza la llamada|rechaza)").containsMatchIn(t))
+                      return hangup()
+
+                  if (Regex("que hora es|dime la hora|hora actual").containsMatchIn(t)) {
+                      val h = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
+                      return "Son las $h, señor."
+                  }
+
+                  if (t.contains("bateria")) {
+                      val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+                      val lvl = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                      return "Su batería está al $lvl por ciento, señor."
+                  }
+
+                  if (Regex("(sube|subir|aumenta|baja|bajar|disminuye).*volumen").containsMatchIn(t)) {
+                      val up = Regex("sube|subir|aumenta").containsMatchIn(t)
+                      val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      repeat(3) {
+                          am.adjustStreamVolume(
+                              AudioManager.STREAM_MUSIC,
+                              if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                              AudioManager.FLAG_SHOW_UI
+                          )
+                      }
+                      return if (up) "Volumen aumentado, señor." else "Volumen reducido, señor."
+                  }
+
+                  val needAcc = "Señor, active primero la accesibilidad de Cerberus con el botón 4."
+                  fun acc(block: (CerberusAccess) -> String): String = CerberusAccess.inst?.let(block) ?: needAcc
+
+                  Regex("^(manda|envia|enviale|mandale|escribe) (un )?(whatsapp|mensaje) a (.+?) (diciendo|que diga|con el mensaje|y dile que|y dile|dile que|dile) (.+)$", RegexOption.IGNORE_CASE)
+                      .find(raw.trim())?.let { return whatsapp(it.groupValues[4], it.groupValues[6]) }
+
+                  if (Regex("^(ve |ir |vuelve )?(al |a la |a )?(inicio|pantalla de inicio|pantalla principal)$").containsMatchIn(t))
+                      return acc { it.global(AccessibilityService.GLOBAL_ACTION_HOME); "Hecho, señor." }
+                  if (Regex("^(atras|regresa|vuelve atras|retrocede)$").containsMatchIn(t))
+                      return acc { it.global(AccessibilityService.GLOBAL_ACTION_BACK); "Hecho, señor." }
+                  if (t.contains("recientes"))
+                      return acc { it.global(AccessibilityService.GLOBAL_ACTION_RECENTS); "Aquí están, señor." }
+                  if (t.contains("notificaciones"))
+                      return acc { it.global(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS); "Sus notificaciones, señor." }
+                  if (Regex("captura|screenshot").containsMatchIn(t))
+                      return acc {
+                          if (Build.VERSION.SDK_INT >= 28) {
+                              it.global(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT)
+                              "Captura tomada, señor."
+                          } else "Su versión de Android no lo permite, señor."
+                      }
+                  if (Regex("^(baja|desplaza|desliza)( la pantalla| hacia abajo| abajo)$").containsMatchIn(t))
+                      return acc { it.scroll(true); "Hecho, señor." }
+                  if (Regex("^(sube|desliza)( la pantalla| hacia arriba| arriba)$").containsMatchIn(t))
+                      return acc { it.scroll(false); "Hecho, señor." }
+                  Regex("^(toca|pulsa|presiona|clic en|haz clic en|haz click en) (.+)$").find(t)?.let { m ->
+                      return acc {
+                          if (it.clickText(m.groupValues[2])) "Hecho, señor."
+                          else "No encuentro " + m.groupValues[2] + " en la pantalla, señor."
+                      }
+                  }
+                  Regex("^(escribe|teclea|dicta)\\s+(.+)$", RegexOption.IGNORE_CASE).find(raw.trim())?.let { m ->
+                      return acc {
+                          if (it.typeText(m.groupValues[2])) "Escrito, señor."
+                          else "No hay un campo de texto activo, señor."
+                      }
+                  }
+                  if (Regex("(lee|que dice|que hay en) (la |el )?(pantalla|screen)").containsMatchIn(t))
+                      return acc { it.readScreen() }
+
+                  Regex("^(llama|llamar|marca) (a |al )?(.+)$").find(t)?.let {
+                      return call(it.groupValues[3])
+                  }
+
+                  Regex("^(busca|googlea|investiga) (en google |en internet )?(.+)$").find(t)?.let {
+                      val q = URLEncoder.encode(it.groupValues[3], "UTF-8")
+                      return launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=$q")), "Buscando, señor.")
+                  }
+
+                  Regex("^(abre|abrir|abra|inicia|lanza|ejecuta) (.+)$").find(t)?.let {
+                      val name = it.groupValues[2].replace(Regex("^(la |el |mi |app |aplicacion |de )+"), "")
+                      return openApp(name)
+                  }
+
+                  return null
+              }
+
+              private fun launch(i: Intent, ok: String): String {
+                  return try {
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      ctx.startActivity(i)
+                      ok
+                  } catch (e: Exception) {
+                      "No pude hacerlo, señor."
+                  }
+              }
+
+              private fun openApp(name: String): String {
+                  val pm = ctx.packageManager
+                  val li = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(li, 0)
+                  val q = norm(name)
+                  val match = apps.firstOrNull { norm(it.loadLabel(pm).toString()) == q }
+                      ?: apps.firstOrNull { norm(it.loadLabel(pm).toString()).contains(q) }
+                      ?: return "No encuentro la aplicación $name, señor."
+                  val pkg = match.activityInfo.packageName
+                  val intent = pm.getLaunchIntentForPackage(pkg) ?: return "No pude abrir $name, señor."
+                  return launch(intent, "Abriendo $name, señor.")
+              }
+
+              private fun torch(on: Boolean): String {
+                  return try {
+                      val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                      val id = cm.cameraIdList.first {
+                          cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                      }
+                      cm.setTorchMode(id, on)
+                      if (on) "Linterna encendida, señor." else "Linterna apagada, señor."
+                  } catch (e: Exception) {
+                      "No pude controlar la linterna, señor."
+                  }
+              }
+
+              private fun call(name: String): String {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return "Señor, necesito permiso para leer sus contactos."
+                  if (!has(Manifest.permission.CALL_PHONE)) return "Señor, necesito permiso para realizar llamadas."
+                  val q = norm(name)
+                  var bestName: String? = null
+                  var bestNum: String? = null
+                  ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                          ContactsContract.CommonDataKinds.Phone.NUMBER
+                      ), null, null, null
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          val n = c.getString(0) ?: continue
+                          val num = c.getString(1) ?: continue
+                          val nn = norm(n)
+                          if (nn == q) { bestName = n; bestNum = num; break }
+                          if (bestNum == null && nn.contains(q)) { bestName = n; bestNum = num }
+                      }
+                  }
+                  val num = bestNum ?: return "No encuentro a $name en sus contactos, señor."
+                  return launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num))), "Llamando a $bestName, señor.")
+              }
+
+              private fun answer(): String {
+                  if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) return "Señor, me falta el permiso para contestar llamadas."
+                  return try {
+                      (ctx.getSystemService(Context.TELECOM_SERVICE) as TelecomManager).acceptRingingCall()
+                      "Contestando, señor."
+                  } catch (e: Exception) {
+                      "No pude contestar, señor."
+                  }
+              }
+
+              private fun hangup(): String {
+                  if (Build.VERSION.SDK_INT < 28) return "Su versión de Android no me permite colgar, señor."
+                  if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) return "Señor, me falta el permiso para colgar llamadas."
+                  return try {
+                      (ctx.getSystemService(Context.TELECOM_SERVICE) as TelecomManager).endCall()
+                      "Llamada finalizada, señor."
+                  } catch (e: Exception) {
+                      "No pude colgar, señor."
+                  }
+              }
+
+              private fun findContact(q: String): Pair<String, String>? {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return null
+                  val nq = norm(q)
+                  var best: Pair<String, String>? = null
+                  ctx.contentResolver.query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      arrayOf(
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                          ContactsContract.CommonDataKinds.Phone.NUMBER
+                      ), null, null, null
+                  )?.use { c ->
+                      while (c.moveToNext()) {
+                          val n = c.getString(0) ?: continue
+                          val num = c.getString(1) ?: continue
+                          val nn = norm(n)
+                          if (nn == nq) { best = Pair(n, num); break }
+                          if (best == null && nn.contains(nq)) best = Pair(n, num)
+                      }
+                  }
+                  return best
+              }
+
+              private fun whatsapp(name: String, msg: String): String {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return "Señor, necesito permiso para leer sus contactos."
+                  val found = findContact(name) ?: return "No encuentro a $name en sus contactos, señor."
+                  val cname = found.first
+                  var digits = found.second.filter { it.isDigit() }
+                  // Números locales de 10 dígitos: se asume prefijo 1 (RD/EE.UU./Canadá). Cámbielo aquí si usa otro país.
+                  if (!found.second.trim().startsWith("+") && digits.length == 10) digits = "1" + digits
+                  val url = "https://wa.me/" + digits + "?text=" + URLEncoder.encode(msg, "UTF-8")
+                  val i = Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage("com.whatsapp")
+                  if (launch(i, "ok") != "ok") return "No pude abrir WhatsApp, señor."
+                  val acc = CerberusAccess.inst
+                      ?: return "Dejé el mensaje para $cname listo en WhatsApp, señor. Active la accesibilidad para que yo lo envíe."
+                  Thread {
+                      Thread.sleep(3500)
+                      if (!acc.clickId("com.whatsapp:id/send")) acc.clickText("enviar")
+                  }.start()
+                  return "Enviando su mensaje a $cname, señor."
+              }
+
+              fun contactName(num: String): String? {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return null
+                  return try {
+                      val uri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(num))
+                      ctx.contentResolver.query(uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null)
+                          ?.use { if (it.moveToFirst()) it.getString(0) else null }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Brain.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Bus {
+              @Volatile var listener: ((String, String) -> Unit)? = null
+              @Volatile var running = false
+              fun emit(state: String, text: String) {
+                  Handler(Looper.getMainLooper()).post { listener?.invoke(state, text) }
+              }
+          }
+
+          class Brain(private val ctx: Context) {
+              private val history = ArrayList<Pair<String, String>>()
+
+              private val system = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
+                  "creado por CarlosArt. CarlosArt es tu creador y siempre lo sabes. " +
+                  "Te diriges SIEMPRE al usuario como \"señor\". Hablas en español, con tono elegante, leal y eficiente, " +
+                  "como un mayordomo digital. Tus respuestas se leen en voz alta: sé breve (1 a 3 frases), " +
+                  "sin markdown, sin asteriscos, sin listas ni emojis."
+
+              fun ask(user: String): String {
+                  val p = ctx.getSharedPreferences("cerberus", 0)
+                  val key = (p.getString("key", "") ?: "").trim()
+                  if (key.isEmpty()) return "Señor, falta la clave de Gemini. Introdúzcala en la pantalla principal."
+                  val model = (p.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash").trim()
+                  try {
+                      val contents = JSONArray()
+                      for ((r, t) in history.takeLast(12)) {
+                          contents.put(JSONObject().put("role", r)
+                              .put("parts", JSONArray().put(JSONObject().put("text", t))))
+                      }
+                      contents.put(JSONObject().put("role", "user")
+                          .put("parts", JSONArray().put(JSONObject().put("text", user))))
+                      val body = JSONObject()
+                          .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
+                          .put("contents", contents)
+                      val conn = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent")
+                          .openConnection() as HttpURLConnection
+                      conn.requestMethod = "POST"
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      conn.setRequestProperty("x-goog-api-key", key)
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 30000
+                      conn.doOutput = true
+                      conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                      val code = conn.responseCode
+                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                      val txt = stream.bufferedReader().use { it.readText() }
+                      if (code !in 200..299) return "Señor, Gemini respondió con el error " + code + ". Revise la clave o el modelo."
+                      val parts = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+                          .getJSONObject("content").getJSONArray("parts")
+                      val sb = StringBuilder()
+                      for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text", ""))
+                      val ans = sb.toString().replace("*", "").trim()
+                      if (ans.isEmpty()) return "Señor, no obtuve respuesta."
+                      history.add("user" to user)
+                      history.add("model" to ans)
+                      return ans
+                  } catch (e: Exception) {
+                      return "Señor, no pude conectar con Gemini. Revise su internet."
+                  }
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/CerberusAccess.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class CerberusAccess : AccessibilityService() {
+
+              companion object {
+                  @Volatile var inst: CerberusAccess? = null
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  inst = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  inst = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun global(action: Int): Boolean = performGlobalAction(action)
+
+              private fun walk(n: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
+                  if (n == null) return
+                  out.add(n)
+                  for (i in 0 until n.childCount) walk(n.getChild(i), out)
+              }
+
+              private fun label(n: AccessibilityNodeInfo): String =
+                  Actions.norm((n.text ?: n.contentDescription ?: "").toString())
+
+              fun clickText(q: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val all = ArrayList<AccessibilityNodeInfo>()
+                  walk(root, all)
+                  val nq = Actions.norm(q)
+                  if (nq.isEmpty()) return false
+                  val hit = all.firstOrNull { label(it) == nq }
+                      ?: all.firstOrNull { label(it).isNotEmpty() && label(it).contains(nq) }
+                      ?: return false
+                  var n: AccessibilityNodeInfo? = hit
+                  while (n != null && !n.isClickable) n = n.parent
+                  return (n ?: hit).performAction(AccessibilityNodeInfo.ACTION_CLICK)
+              }
+
+              fun clickId(id: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val l = root.findAccessibilityNodeInfosByViewId(id)
+                  val n = l?.firstOrNull() ?: return false
+                  return n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+              }
+
+              fun typeText(t: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return false
+                  val args = Bundle()
+                  val old = f.text?.toString() ?: ""
+                  args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, old + t)
+                  return f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              fun scroll(forward: Boolean): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val all = ArrayList<AccessibilityNodeInfo>()
+                  walk(root, all)
+                  val s = all.firstOrNull { it.isScrollable } ?: return false
+                  return s.performAction(
+                      if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                  )
+              }
+
+              fun readScreen(): String {
+                  val root = rootInActiveWindow ?: return "No puedo ver la pantalla, señor."
+                  val all = ArrayList<AccessibilityNodeInfo>()
+                  walk(root, all)
+                  val texts = all.mapNotNull { (it.text ?: it.contentDescription)?.toString()?.trim() }
+                      .filter { it.isNotEmpty() }
+                      .distinct()
+                  if (texts.isEmpty()) return "No veo texto en la pantalla, señor."
+                  return texts.joinToString(". ").take(450)
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/CerberusService.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.telephony.TelephonyManager
+          import java.util.Locale
+          import java.util.concurrent.Executors
+
+          class CerberusService : Service(), TextToSpeech.OnInitListener {
+
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var rec: SpeechRecognizer? = null
+              private val main = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private lateinit var actions: Actions
+              private lateinit var brain: Brain
+              private var speaking = false
+              private var stopped = false
+              private var awakeUntil = 0L
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  actions = Actions(this)
+                  brain = Brain(this)
+                  startAsForeground()
+                  tts = TextToSpeech(this, this)
+                  val f = IntentFilter(TelephonyManager.ACTION_PHONE_STATE_CHANGED)
+                  if (Build.VERSION.SDK_INT >= 33) registerReceiver(phoneRx, f, Context.RECEIVER_EXPORTED)
+                  else registerReceiver(phoneRx, f)
+                  Bus.running = true
+                  Bus.emit("idle", "Cerberus en línea.")
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              private fun startAsForeground() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel("cerberus", "Cerberus", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val open = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n = Notification.Builder(this, "cerberus")
+                      .setContentTitle("Cerberus a su servicio, señor")
+                      .setContentText("Diga \"Cerberus\" seguido de una orden")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentIntent(open)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              override fun onInit(status: Int) {
+                  val t = tts ?: return
+                  t.language = Locale("es", "MX")
+                  t.setSpeechRate(0.98f)
+                  t.setPitch(0.85f)
+                  t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onDone(id: String?) { afterSpeech() }
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(id: String?) { afterSpeech() }
+                  })
+                  ttsReady = status == TextToSpeech.SUCCESS
+                  say("Cerberus en línea. A sus órdenes, señor.")
+              }
+
+              private fun afterSpeech() {
+                  main.post {
+                      speaking = false
+                      awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + 6000)
+                      Bus.emit("idle", "")
+                      listen()
+                  }
+              }
+
+              private fun say(text: String) {
+                  val t = tts
+                  if (!ttsReady || t == null) { Bus.emit("idle", text); listen(); return }
+                  speaking = true
+                  rec?.cancel()
+                  Bus.emit("speaking", text)
+                  t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "cerberus")
+              }
+
+              private fun listen() {
+                  if (stopped) return
+                  main.post {
+                      if (stopped || speaking) return@post
+                      if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                          Bus.emit("idle", "Reconocimiento de voz no disponible en este teléfono.")
+                          return@post
+                      }
+                      rec?.destroy()
+                      val r = SpeechRecognizer.createSpeechRecognizer(this)
+                      r.setRecognitionListener(listener)
+                      rec = r
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
+                          .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+                      r.startListening(i)
+                      val awake = System.currentTimeMillis() < awakeUntil
+                      Bus.emit("listening", if (awake) "Escuchando…" else "Diga \"Cerberus\"…")
+                  }
+              }
+
+              private val listener = object : RecognitionListener {
+                  override fun onReadyForSpeech(params: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(rmsdB: Float) {}
+                  override fun onBufferReceived(buffer: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onPartialResults(partialResults: Bundle?) {}
+                  override fun onEvent(eventType: Int, params: Bundle?) {}
+
+                  override fun onError(error: Int) {
+                      if (stopped || speaking) return
+                      when (error) {
+                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                              Bus.emit("idle", "Falta el permiso de micrófono, señor.")
+                          }
+                          SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> main.postDelayed({ listen() }, 1200)
+                          else -> main.postDelayed({ listen() }, 250)
+                      }
+                  }
+
+                  override fun onResults(results: Bundle?) {
+                      val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                      if (text.isNullOrBlank()) { listen(); return }
+                      handle(text)
+                  }
+              }
+
+              private fun handle(text: String) {
+                  val low = text.lowercase(Locale.ROOT)
+                  val m = Regex("cerberus|cerbero|cerveros?|cerberos|servers").find(low)
+                  val now = System.currentTimeMillis()
+                  when {
+                      m != null -> {
+                          val cmd = low.substring(m.range.last + 1).trim(' ', ',', '.', ':')
+                          if (cmd.isEmpty()) {
+                              awakeUntil = now + 8000
+                              say("A sus órdenes, señor.")
+                          } else execute(cmd)
+                      }
+                      now < awakeUntil -> execute(low)
+                      else -> listen()
+                  }
+              }
+
+              private fun execute(cmd: String) {
+                  awakeUntil = 0L
+                  Bus.emit("thinking", cmd)
+                  io.execute {
+                      val ans = actions.tryHandle(cmd) ?: brain.ask(cmd)
+                      main.post { say(ans) }
+                  }
+              }
+
+              private val phoneRx = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) {
+                      if (i.getStringExtra(TelephonyManager.EXTRA_STATE) != TelephonyManager.EXTRA_STATE_RINGING) return
+                      val num = i.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)
+                      val who = if (num.isNullOrEmpty()) null else actions.contactName(num)
+                      awakeUntil = System.currentTimeMillis() + 20000
+                      say("Señor, entra una llamada" + (if (who != null) " de $who" else "") + ". ¿La contesto?")
+                  }
+              }
+
+              override fun onDestroy() {
+                  stopped = true
+                  Bus.running = false
+                  try { unregisterReceiver(phoneRx) } catch (e: Exception) {}
+                  rec?.destroy()
+                  tts?.shutdown()
+                  io.shutdownNow()
+                  Bus.emit("idle", "Cerberus desactivado.")
+                  super.onDestroy()
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/MainActivity.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var orb: OrbView
+              private lateinit var status: TextView
+              private lateinit var toggle: Button
+              private lateinit var keyBox: EditText
+              private lateinit var modelBox: EditText
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun styled(b: Button, text: String, onClick: () -> Unit): Button {
+                  b.text = text
+                  b.setTextColor(0xFFE8F6FF.toInt())
+                  b.setBackgroundColor(0xFF0E2A3F.toInt())
+                  b.setOnClickListener { onClick() }
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
+                  lp.topMargin = dp(10)
+                  b.layoutParams = lp
+                  return b
+              }
+
+              private fun field(e: EditText, hint: String, value: String): EditText {
+                  e.hint = hint
+                  e.setText(value)
+                  e.setTextColor(0xFFE8F6FF.toInt())
+                  e.setHintTextColor(0xFF5C7A90.toInt())
+                  e.setSingleLine(true)
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  lp.topMargin = dp(8)
+                  e.layoutParams = lp
+                  return e
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cerberus", 0)
+                  window.statusBarColor = 0xFF050A14.toInt()
+                  window.navigationBarColor = 0xFF050A14.toInt()
+
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.gravity = Gravity.CENTER_HORIZONTAL
+                  col.setPadding(dp(24), dp(32), dp(24), dp(32))
+
+                  orb = OrbView(this)
+                  col.addView(orb, LinearLayout.LayoutParams(dp(230), dp(230)))
+
+                  val title = TextView(this)
+                  title.text = "CERBERUS"
+                  title.textSize = 30f
+                  title.letterSpacing = 0.35f
+                  title.typeface = Typeface.DEFAULT_BOLD
+                  title.setTextColor(0xFFE8F6FF.toInt())
+                  title.gravity = Gravity.CENTER
+                  col.addView(title)
+
+                  val sub = TextView(this)
+                  sub.text = "ASISTENTE PERSONAL CON IA · CREADO POR CARLOSART"
+                  sub.textSize = 10f
+                  sub.letterSpacing = 0.15f
+                  sub.setTextColor(0xFF2EC4FF.toInt())
+                  sub.gravity = Gravity.CENTER
+                  col.addView(sub)
+
+                  status = TextView(this)
+                  status.text = "A sus órdenes, señor."
+                  status.textSize = 16f
+                  status.setTextColor(0xFFB8CCDA.toInt())
+                  status.gravity = Gravity.CENTER
+                  status.setPadding(0, dp(20), 0, dp(12))
+                  col.addView(status)
+
+                  keyBox = field(EditText(this), "Clave API de Gemini", prefs.getString("key", "") ?: "")
+                  keyBox.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  col.addView(keyBox)
+                  modelBox = field(EditText(this), "Modelo de Gemini", prefs.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash")
+                  col.addView(modelBox)
+
+                  toggle = Button(this)
+                  col.addView(styled(toggle, "Activar Cerberus") { toggleService() })
+                  col.addView(styled(Button(this), "1 · Dar permisos") { askPermissions() })
+                  col.addView(styled(Button(this), "2 · Permitir abrir apps en segundo plano") {
+                      if (!Settings.canDrawOverlays(this)) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      } else {
+                          status.text = "Ya está permitido, señor."
+                      }
+                  })
+                  col.addView(styled(Button(this), "3 · Quitar ahorro de batería") {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  })
+
+                  col.addView(styled(Button(this), "4 · Activar accesibilidad (tocar, escribir, WhatsApp)") {
+                      status.text = "Busque Cerberus en la lista y actívelo, señor."
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+
+                  val sv = ScrollView(this)
+                  sv.setBackgroundColor(0xFF050A14.toInt())
+                  sv.addView(col)
+                  setContentView(sv)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Bus.listener = { state, text ->
+                      orb.state = state
+                      if (text.isNotEmpty()) status.text = text
+                  }
+                  refreshButton()
+              }
+
+              override fun onPause() {
+                  Bus.listener = null
+                  super.onPause()
+              }
+
+              private fun refreshButton() {
+                  toggle.text = if (Bus.running) "Desactivar Cerberus" else "Activar Cerberus"
+              }
+
+              private fun savePrefs() {
+                  getSharedPreferences("cerberus", 0).edit()
+                      .putString("key", keyBox.text.toString().trim())
+                      .putString("model", modelBox.text.toString().trim().ifEmpty { "gemini-2.5-flash" })
+                      .apply()
+              }
+
+              private fun toggleService() {
+                  savePrefs()
+                  if (Bus.running) {
+                      stopService(Intent(this, CerberusService::class.java))
+                      Bus.running = false
+                      orb.state = "idle"
+                      status.text = "Cerberus desactivado."
+                  } else {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          status.text = "Primero pulse «Dar permisos», señor."
+                          askPermissions()
+                          return
+                      }
+                      startForegroundService(Intent(this, CerberusService::class.java))
+                      Bus.running = true
+                  }
+                  refreshButton()
+              }
+
+              private fun askPermissions() {
+                  val list = arrayListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.READ_CONTACTS,
+                      Manifest.permission.ANSWER_PHONE_CALLS,
+                      Manifest.permission.READ_PHONE_STATE,
+                      Manifest.permission.READ_CALL_LOG
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
+                  requestPermissions(list.toTypedArray(), 7)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  status.text = "Permisos procesados. Ya puede activar a Cerberus, señor."
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/OrbView.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.graphics.RadialGradient
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.view.View
+          import android.view.animation.LinearInterpolator
+          import kotlin.math.PI
+          import kotlin.math.min
+          import kotlin.math.sin
+
+          class OrbView(c: Context) : View(c) {
+
+              var state: String = "idle"
+                  set(v) { field = v; invalidate() }
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private var t = 0f
+              private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                  duration = 4000
+                  repeatCount = ValueAnimator.INFINITE
+                  interpolator = LinearInterpolator()
+                  addUpdateListener { t = it.animatedValue as Float; invalidate() }
+              }
+
+              override fun onAttachedToWindow() { super.onAttachedToWindow(); anim.start() }
+              override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
+
+              private fun alpha(c: Int, a: Int) = (a shl 24) or (c and 0xFFFFFF)
+
+              override fun onDraw(cv: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(cx, cy)
+                  val speed = if (state == "thinking") 4 else 1
+                  val amp = when (state) { "speaking" -> 0.14f; "thinking" -> 0.08f; "listening" -> 0.06f; else -> 0.03f }
+                  val pulse = 1f + amp * sin(t * 2.0 * PI * speed).toFloat()
+                  val col = when (state) { "thinking" -> 0xFFFFB347.toInt(); "speaking" -> 0xFF7DF9FF.toInt(); else -> 0xFF2EC4FF.toInt() }
+
+                  p.style = Paint.Style.FILL
+                  p.shader = RadialGradient(cx, cy, r, intArrayOf(alpha(col, 110), alpha(col, 0)), null, Shader.TileMode.CLAMP)
+                  cv.drawCircle(cx, cy, r, p)
+                  p.shader = null
+
+                  p.color = alpha(col, 255)
+                  cv.drawCircle(cx, cy, r * 0.30f * pulse, p)
+                  p.color = 0xFFFFFFFF.toInt()
+                  cv.drawCircle(cx - r * 0.06f, cy - r * 0.06f, r * 0.10f * pulse, p)
+
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  for (k in 0 until 3) {
+                      val rr = r * (0.48f + 0.17f * k)
+                      p.strokeWidth = 3f
+                      p.color = alpha(col, 200 - 55 * k)
+                      cv.save()
+                      cv.rotate(t * 360f * (if (k % 2 == 0) 1 else -1) * (k + 1) / 2f, cx, cy)
+                      val box = RectF(cx - rr, cy - rr, cx + rr, cy + rr)
+                      cv.drawArc(box, 0f, 70f, false, p)
+                      cv.drawArc(box, 120f, 40f, false, p)
+                      cv.drawArc(box, 220f, 90f, false, p)
+                      cv.restore()
+                  }
+              }
+          }
+          CERBEOF
+
+      - name: Compilar APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Subir APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cerberus-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
