@@ -113,6 +113,10 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="false" />
+
                   <service
                       android:name=".CerberusService"
                       android:exported="false"
@@ -428,6 +432,7 @@ jobs:
           package com.carlosart.cerberus
 
           import android.content.Context
+          import android.content.SharedPreferences
           import android.os.Handler
           import android.os.Looper
           import org.json.JSONArray
@@ -438,13 +443,54 @@ jobs:
           object Bus {
               @Volatile var listener: ((String, String) -> Unit)? = null
               @Volatile var running = false
+              @Volatile var level = 0f      // volumen del micrófono (0..1), lo lee la animación
+              @Volatile var kickAt = 0L     // instante de la última palabra hablada por Cerberus
+
+              fun kick() { kickAt = System.nanoTime() }
+
               fun emit(state: String, text: String) {
                   Handler(Looper.getMainLooper()).post { listener?.invoke(state, text) }
               }
           }
 
+          object Cfg {
+              val ids = arrayOf("gemini", "groq", "openrouter", "custom")
+              val names = arrayOf("Gemini (Google)", "Groq", "OpenRouter", "Otro (compatible con OpenAI)")
+
+              fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("cerberus", 0)
+
+              fun provider(c: Context): String = prefs(c).getString("provider", "gemini") ?: "gemini"
+
+              fun name(id: String): String = names[ids.indexOf(id).coerceAtLeast(0)]
+
+              fun defModel(id: String): String = when (id) {
+                  "gemini" -> "gemini-2.5-flash"
+                  "groq" -> "openai/gpt-oss-20b"
+                  "openrouter" -> "openai/gpt-oss-20b:free"
+                  else -> ""
+              }
+
+              fun key(c: Context, id: String): String {
+                  val p = prefs(c)
+                  var k = p.getString("key_" + id, null)
+                  if (k == null && id == "gemini") k = p.getString("key", null)
+                  return (k ?: "").trim()
+              }
+
+              fun model(c: Context, id: String): String {
+                  val m = (prefs(c).getString("model_" + id, null) ?: "").trim()
+                  return if (m.isEmpty()) defModel(id) else m
+              }
+
+              fun base(c: Context, id: String): String = when (id) {
+                  "groq" -> "https://api.groq.com/openai/v1"
+                  "openrouter" -> "https://openrouter.ai/api/v1"
+                  else -> (prefs(c).getString("base_custom", "") ?: "").trim().trimEnd('/')
+              }
+          }
+
           class Brain(private val ctx: Context) {
-              private val history = ArrayList<Pair<String, String>>()
+              private val history = ArrayList<Pair<String, String>>() // "user" / "assistant"
 
               private val system = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
                   "creado por CarlosArt. CarlosArt es tu creador y siempre lo sabes. " +
@@ -452,46 +498,83 @@ jobs:
                   "como un mayordomo digital. Tus respuestas se leen en voz alta: sé breve (1 a 3 frases), " +
                   "sin markdown, sin asteriscos, sin listas ni emojis."
 
+              private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
+                  val conn = URL(url).openConnection() as HttpURLConnection
+                  conn.requestMethod = "POST"
+                  conn.setRequestProperty("Content-Type", "application/json")
+                  for ((k, v) in headers) conn.setRequestProperty(k, v)
+                  conn.connectTimeout = 15000
+                  conn.readTimeout = 40000
+                  conn.doOutput = true
+                  conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val code = conn.responseCode
+                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                  val txt = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                  return Pair(code, txt)
+              }
+
+              private fun errMsg(code: Int, txt: String): String {
+                  val m = try {
+                      JSONObject(txt).optJSONObject("error")?.optString("message") ?: ""
+                  } catch (e: Exception) {
+                      ""
+                  }
+                  val d = m.take(110)
+                  return "Señor, error " + code + (if (d.isNotEmpty()) ": " + d else "") + "."
+              }
+
               fun ask(user: String): String {
-                  val p = ctx.getSharedPreferences("cerberus", 0)
-                  val key = (p.getString("key", "") ?: "").trim()
-                  if (key.isEmpty()) return "Señor, falta la clave de Gemini. Introdúzcala en la pantalla principal."
-                  val model = (p.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash").trim()
+                  val prov = Cfg.provider(ctx)
+                  val key = Cfg.key(ctx, prov)
+                  if (key.isEmpty()) return "Señor, falta la clave de " + Cfg.name(prov) + ". Configúrela en Ajustes."
+                  val model = Cfg.model(ctx, prov)
+                  if (model.isEmpty()) return "Señor, falta el nombre del modelo en Ajustes."
                   try {
-                      val contents = JSONArray()
-                      for ((r, t) in history.takeLast(12)) {
-                          contents.put(JSONObject().put("role", r)
-                              .put("parts", JSONArray().put(JSONObject().put("text", t))))
+                      var ans = ""
+                      if (prov == "gemini") {
+                          val contents = JSONArray()
+                          for ((r, t) in history.takeLast(12)) {
+                              contents.put(JSONObject().put("role", if (r == "assistant") "model" else "user")
+                                  .put("parts", JSONArray().put(JSONObject().put("text", t))))
+                          }
+                          contents.put(JSONObject().put("role", "user")
+                              .put("parts", JSONArray().put(JSONObject().put("text", user))))
+                          val body = JSONObject()
+                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
+                              .put("contents", contents)
+                          val res = post(
+                              "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+                              mapOf("x-goog-api-key" to key), body
+                          )
+                          if (res.first !in 200..299) return errMsg(res.first, res.second)
+                          val parts = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
+                              .getJSONObject("content").getJSONArray("parts")
+                          val sb = StringBuilder()
+                          for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text", ""))
+                          ans = sb.toString()
+                      } else {
+                          val base = Cfg.base(ctx, prov)
+                          if (base.isEmpty()) return "Señor, falta la dirección del servicio en Ajustes."
+                          val msgs = JSONArray()
+                          msgs.put(JSONObject().put("role", "system").put("content", system))
+                          for ((r, t) in history.takeLast(12)) msgs.put(JSONObject().put("role", r).put("content", t))
+                          msgs.put(JSONObject().put("role", "user").put("content", user))
+                          val body = JSONObject().put("model", model).put("messages", msgs)
+                          val res = post(
+                              base + "/chat/completions",
+                              mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus"), body
+                          )
+                          if (res.first !in 200..299) return errMsg(res.first, res.second)
+                          val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+                          ans = if (msg.isNull("content")) "" else msg.getString("content")
                       }
-                      contents.put(JSONObject().put("role", "user")
-                          .put("parts", JSONArray().put(JSONObject().put("text", user))))
-                      val body = JSONObject()
-                          .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
-                          .put("contents", contents)
-                      val conn = URL("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent")
-                          .openConnection() as HttpURLConnection
-                      conn.requestMethod = "POST"
-                      conn.setRequestProperty("Content-Type", "application/json")
-                      conn.setRequestProperty("x-goog-api-key", key)
-                      conn.connectTimeout = 15000
-                      conn.readTimeout = 30000
-                      conn.doOutput = true
-                      conn.outputStream.use { it.write(body.toString().toByteArray()) }
-                      val code = conn.responseCode
-                      val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                      val txt = stream.bufferedReader().use { it.readText() }
-                      if (code !in 200..299) return "Señor, Gemini respondió con el error " + code + ". Revise la clave o el modelo."
-                      val parts = JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
-                          .getJSONObject("content").getJSONArray("parts")
-                      val sb = StringBuilder()
-                      for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text", ""))
-                      val ans = sb.toString().replace("*", "").trim()
+                      ans = ans.replace("*", "").trim()
                       if (ans.isEmpty()) return "Señor, no obtuve respuesta."
-                      history.add("user" to user)
-                      history.add("model" to ans)
+                      history.add(Pair("user", user))
+                      history.add(Pair("assistant", ans))
                       return ans
                   } catch (e: Exception) {
-                      return "Señor, no pude conectar con Gemini. Revise su internet."
+                      return "Señor, no pude conectar con " + Cfg.name(prov) + ". Revise su internet."
                   }
               }
           }
@@ -675,7 +758,8 @@ jobs:
                   t.setSpeechRate(0.98f)
                   t.setPitch(0.85f)
                   t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                      override fun onStart(id: String?) {}
+                      override fun onStart(id: String?) { Bus.kick() }
+                      override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) { Bus.kick() }
                       override fun onDone(id: String?) { afterSpeech() }
                       @Deprecated("Deprecated in Java")
                       override fun onError(id: String?) { afterSpeech() }
@@ -687,6 +771,7 @@ jobs:
               private fun afterSpeech() {
                   main.post {
                       speaking = false
+                      Bus.level = 0f
                       awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + 6000)
                       Bus.emit("idle", "")
                       listen()
@@ -727,7 +812,7 @@ jobs:
               private val listener = object : RecognitionListener {
                   override fun onReadyForSpeech(params: Bundle?) {}
                   override fun onBeginningOfSpeech() {}
-                  override fun onRmsChanged(rmsdB: Float) {}
+                  override fun onRmsChanged(rmsdB: Float) { Bus.level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f) }
                   override fun onBufferReceived(buffer: ByteArray?) {}
                   override fun onEndOfSpeech() {}
                   override fun onPartialResults(partialResults: Bundle?) {}
@@ -808,65 +893,45 @@ jobs:
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Typeface
-          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
-          import android.provider.Settings
-          import android.text.InputType
           import android.view.Gravity
-          import android.view.View
           import android.widget.Button
-          import android.widget.EditText
           import android.widget.LinearLayout
-          import android.widget.ScrollView
           import android.widget.TextView
 
           class MainActivity : Activity() {
 
-              private lateinit var orb: OrbView
+              private lateinit var neural: NeuralView
               private lateinit var status: TextView
+              private lateinit var brainLine: TextView
               private lateinit var toggle: Button
-              private lateinit var keyBox: EditText
-              private lateinit var modelBox: EditText
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-              private fun styled(b: Button, text: String, onClick: () -> Unit): Button {
-                  b.text = text
-                  b.setTextColor(0xFFE8F6FF.toInt())
-                  b.setBackgroundColor(0xFF0E2A3F.toInt())
-                  b.setOnClickListener { onClick() }
-                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
-                  lp.topMargin = dp(10)
-                  b.layoutParams = lp
-                  return b
-              }
-
-              private fun field(e: EditText, hint: String, value: String): EditText {
-                  e.hint = hint
-                  e.setText(value)
-                  e.setTextColor(0xFFE8F6FF.toInt())
-                  e.setHintTextColor(0xFF5C7A90.toInt())
-                  e.setSingleLine(true)
-                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-                  lp.topMargin = dp(8)
-                  e.layoutParams = lp
-                  return e
-              }
-
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  val prefs = getSharedPreferences("cerberus", 0)
                   window.statusBarColor = 0xFF050A14.toInt()
                   window.navigationBarColor = 0xFF050A14.toInt()
 
-                  val col = LinearLayout(this)
-                  col.orientation = LinearLayout.VERTICAL
-                  col.gravity = Gravity.CENTER_HORIZONTAL
-                  col.setPadding(dp(24), dp(32), dp(24), dp(32))
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFF050A14.toInt())
+                  root.setPadding(dp(20), dp(8), dp(20), dp(24))
 
-                  orb = OrbView(this)
-                  col.addView(orb, LinearLayout.LayoutParams(dp(230), dp(230)))
+                  val settings = TextView(this)
+                  settings.text = "⚙  Ajustes"
+                  settings.textSize = 16f
+                  settings.setTextColor(0xFF2EC4FF.toInt())
+                  settings.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  settings.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+                  val top = LinearLayout(this)
+                  top.gravity = Gravity.END
+                  top.addView(settings)
+                  root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  neural = NeuralView(this)
+                  root.addView(neural, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(260)))
 
                   val title = TextView(this)
                   title.text = "CERBERUS"
@@ -875,7 +940,8 @@ jobs:
                   title.typeface = Typeface.DEFAULT_BOLD
                   title.setTextColor(0xFFE8F6FF.toInt())
                   title.gravity = Gravity.CENTER
-                  col.addView(title)
+                  title.setPadding(0, dp(12), 0, 0)
+                  root.addView(title)
 
                   val sub = TextView(this)
                   sub.text = "ASISTENTE PERSONAL CON IA · CREADO POR CARLOSART"
@@ -883,53 +949,45 @@ jobs:
                   sub.letterSpacing = 0.15f
                   sub.setTextColor(0xFF2EC4FF.toInt())
                   sub.gravity = Gravity.CENTER
-                  col.addView(sub)
+                  root.addView(sub)
+
+                  brainLine = TextView(this)
+                  brainLine.textSize = 12f
+                  brainLine.setTextColor(0xFF5C7A90.toInt())
+                  brainLine.gravity = Gravity.CENTER
+                  brainLine.setPadding(0, dp(6), 0, 0)
+                  root.addView(brainLine)
 
                   status = TextView(this)
                   status.text = "A sus órdenes, señor."
-                  status.textSize = 16f
+                  status.textSize = 17f
                   status.setTextColor(0xFFB8CCDA.toInt())
                   status.gravity = Gravity.CENTER
-                  status.setPadding(0, dp(20), 0, dp(12))
-                  col.addView(status)
-
-                  keyBox = field(EditText(this), "Clave API de Gemini", prefs.getString("key", "") ?: "")
-                  keyBox.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                  col.addView(keyBox)
-                  modelBox = field(EditText(this), "Modelo de Gemini", prefs.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash")
-                  col.addView(modelBox)
+                  status.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  root.addView(status, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
                   toggle = Button(this)
-                  col.addView(styled(toggle, "Activar Cerberus") { toggleService() })
-                  col.addView(styled(Button(this), "1 · Dar permisos") { askPermissions() })
-                  col.addView(styled(Button(this), "2 · Permitir abrir apps en segundo plano") {
-                      if (!Settings.canDrawOverlays(this)) {
-                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-                      } else {
-                          status.text = "Ya está permitido, señor."
-                      }
-                  })
-                  col.addView(styled(Button(this), "3 · Quitar ahorro de batería") {
-                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
-                  })
+                  toggle.setTextColor(0xFFE8F6FF.toInt())
+                  toggle.setBackgroundColor(0xFF0E2A3F.toInt())
+                  toggle.textSize = 17f
+                  toggle.setOnClickListener { toggleService() }
+                  root.addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(60)))
 
-                  col.addView(styled(Button(this), "4 · Activar accesibilidad (tocar, escribir, WhatsApp)") {
-                      status.text = "Busque Cerberus en la lista y actívelo, señor."
-                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                  })
-
-                  val sv = ScrollView(this)
-                  sv.setBackgroundColor(0xFF050A14.toInt())
-                  sv.addView(col)
-                  setContentView(sv)
+                  setContentView(root)
               }
 
               override fun onResume() {
                   super.onResume()
                   Bus.listener = { state, text ->
-                      orb.state = state
+                      neural.state = state
                       if (text.isNotEmpty()) status.text = text
                   }
+                  val prov = Cfg.provider(this)
+                  brainLine.text = "Cerebro: " + Cfg.name(prov) + " · " + Cfg.model(this, prov).ifEmpty { "sin modelo" }
+                  if (Cfg.key(this, prov).isEmpty() && !Bus.running) {
+                      status.text = "Toque Ajustes y configure su clave, señor."
+                  }
+                  neural.state = if (Bus.running) "listening" else "idle"
                   refreshButton()
               }
 
@@ -942,23 +1000,15 @@ jobs:
                   toggle.text = if (Bus.running) "Desactivar Cerberus" else "Activar Cerberus"
               }
 
-              private fun savePrefs() {
-                  getSharedPreferences("cerberus", 0).edit()
-                      .putString("key", keyBox.text.toString().trim())
-                      .putString("model", modelBox.text.toString().trim().ifEmpty { "gemini-2.5-flash" })
-                      .apply()
-              }
-
               private fun toggleService() {
-                  savePrefs()
                   if (Bus.running) {
                       stopService(Intent(this, CerberusService::class.java))
                       Bus.running = false
-                      orb.state = "idle"
+                      neural.state = "idle"
                       status.text = "Cerberus desactivado."
                   } else {
                       if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                          status.text = "Primero pulse «Dar permisos», señor."
+                          status.text = "Necesito permisos, señor. Acéptelos o use Ajustes."
                           askPermissions()
                           return
                       }
@@ -988,74 +1038,404 @@ jobs:
           }
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
-          cat > app/src/main/java/com/carlosart/cerberus/OrbView.kt <<'CERBEOF'
+          cat > app/src/main/java/com/carlosart/cerberus/NeuralView.kt <<'CERBEOF'
           package com.carlosart.cerberus
 
           import android.animation.ValueAnimator
           import android.content.Context
           import android.graphics.Canvas
           import android.graphics.Paint
-          import android.graphics.RadialGradient
-          import android.graphics.RectF
-          import android.graphics.Shader
           import android.view.View
-          import android.view.animation.LinearInterpolator
-          import kotlin.math.PI
-          import kotlin.math.min
+          import kotlin.math.cos
+          import kotlin.math.exp
+          import kotlin.math.max
           import kotlin.math.sin
+          import kotlin.random.Random
 
-          class OrbView(c: Context) : View(c) {
+          /**
+           * Red neuronal animada. Las señales viajan de la capa de entrada a la de salida.
+           * - Hablando: cada palabra de Cerberus lanza una ráfaga de impulsos.
+           * - Escuchando: la intensidad sigue el volumen de su voz.
+           * - Pensando: actividad rápida y constante en ámbar.
+           */
+          class NeuralView(c: Context) : View(c) {
 
               var state: String = "idle"
-                  set(v) { field = v; invalidate() }
 
-              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
-              private var t = 0f
+              private val layers = intArrayOf(3, 5, 6, 5, 3)
+              private val n = layers.sum()
+              private val layerOf = IntArray(n)
+              private val idxIn = IntArray(n)
+              private val ea = ArrayList<Int>()
+              private val eb = ArrayList<Int>()
+              private val from = Array(n) { ArrayList<Int>() }
+              private val inputEdges = ArrayList<Int>()
+              private val bx = FloatArray(n)
+              private val by = FloatArray(n)
+              private val px = FloatArray(n)
+              private val py = FloatArray(n)
+              private val glow = FloatArray(n)
+
+              private class Pulse(var e: Int, var p: Float, var sp: Float)
+
+              private val pulses = ArrayList<Pulse>()
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val dens = c.resources.displayMetrics.density
+              private var last = 0L
+              private var tt = 0f
+              private var energy = 0.1f
+              private var spawnAcc = 0f
+              private var lastKick = 0L
+
               private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
-                  duration = 4000
+                  duration = 1000
                   repeatCount = ValueAnimator.INFINITE
-                  interpolator = LinearInterpolator()
-                  addUpdateListener { t = it.animatedValue as Float; invalidate() }
+                  addUpdateListener { step(); invalidate() }
               }
 
-              override fun onAttachedToWindow() { super.onAttachedToWindow(); anim.start() }
+              init {
+                  var k = 0
+                  for (l in layers.indices) for (i in 0 until layers[l]) {
+                      layerOf[k] = l
+                      idxIn[k] = i
+                      k++
+                  }
+                  var start = 0
+                  for (l in 0 until layers.size - 1) {
+                      val next = start + layers[l]
+                      for (i in 0 until layers[l]) for (j in 0 until layers[l + 1]) {
+                          val a = start + i
+                          val b = next + j
+                          ea.add(a)
+                          eb.add(b)
+                          from[a].add(ea.size - 1)
+                          if (l == 0) inputEdges.add(ea.size - 1)
+                      }
+                      start = next
+                  }
+              }
+
+              override fun onAttachedToWindow() { super.onAttachedToWindow(); last = 0L; anim.start() }
               override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
 
-              private fun alpha(c: Int, a: Int) = (a shl 24) or (c and 0xFFFFFF)
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  super.onSizeChanged(w, h, ow, oh)
+                  val padX = dens * 18f
+                  val padY = dens * 16f
+                  for (k in 0 until n) {
+                      val l = layerOf[k]
+                      bx[k] = padX + (w - 2f * padX) * l / (layers.size - 1f)
+                      by[k] = padY + (h - 2f * padY) * (idxIn[k] + 1f) / (layers[l] + 1f)
+                  }
+              }
+
+              private fun speed(): Float = 1.0f + energy * 2.2f + Random.nextFloat() * 0.6f
+
+              private fun spawn() {
+                  if (pulses.size >= 160) return
+                  val e = inputEdges[Random.nextInt(inputEdges.size)]
+                  glow[ea[e]] = 0.8f
+                  pulses.add(Pulse(e, 0f, speed()))
+              }
+
+              private fun step() {
+                  val now = System.nanoTime()
+                  val dt = if (last == 0L) 0.016f else ((now - last) / 1e9f).coerceIn(0f, 0.05f)
+                  last = now
+                  tt += dt
+
+                  val kickE = if (Bus.kickAt == 0L) 0f else exp(-((now - Bus.kickAt) / 1e9f) * 7f)
+                  energy = when (state) {
+                      "speaking" -> max(0.35f + 0.12f * sin(tt * 9f), 0.3f + 0.7f * kickE)
+                      "thinking" -> 0.75f
+                      "listening" -> 0.18f + 0.8f * Bus.level
+                      else -> 0.1f
+                  }
+                  if (Bus.kickAt != lastKick) {
+                      lastKick = Bus.kickAt
+                      if (state == "speaking") repeat(5) { spawn() }
+                  }
+
+                  for (i in 0 until n) glow[i] = max(0f, glow[i] - dt * 2.2f)
+
+                  spawnAcc += energy * 36f * dt
+                  while (spawnAcc >= 1f) {
+                      spawnAcc -= 1f
+                      spawn()
+                  }
+
+                  val born = ArrayList<Pulse>()
+                  val iter = pulses.iterator()
+                  while (iter.hasNext()) {
+                      val p = iter.next()
+                      p.p += p.sp * dt
+                      if (p.p >= 1f) {
+                          val b = eb[p.e]
+                          glow[b] = 1f
+                          iter.remove()
+                          val out = from[b]
+                          if (out.isNotEmpty() && pulses.size + born.size < 160 &&
+                              Random.nextFloat() < 0.5f + 0.4f * energy
+                          ) {
+                              born.add(Pulse(out[Random.nextInt(out.size)], 0f, speed()))
+                          }
+                      }
+                  }
+                  pulses.addAll(born)
+              }
+
+              private fun alpha(c: Int, a: Int) = (a.coerceIn(0, 255) shl 24) or (c and 0xFFFFFF)
 
               override fun onDraw(cv: Canvas) {
-                  val cx = width / 2f
-                  val cy = height / 2f
-                  val r = min(cx, cy)
-                  val speed = if (state == "thinking") 4 else 1
-                  val amp = when (state) { "speaking" -> 0.14f; "thinking" -> 0.08f; "listening" -> 0.06f; else -> 0.03f }
-                  val pulse = 1f + amp * sin(t * 2.0 * PI * speed).toFloat()
-                  val col = when (state) { "thinking" -> 0xFFFFB347.toInt(); "speaking" -> 0xFF7DF9FF.toInt(); else -> 0xFF2EC4FF.toInt() }
-
-                  p.style = Paint.Style.FILL
-                  p.shader = RadialGradient(cx, cy, r, intArrayOf(alpha(col, 110), alpha(col, 0)), null, Shader.TileMode.CLAMP)
-                  cv.drawCircle(cx, cy, r, p)
-                  p.shader = null
-
-                  p.color = alpha(col, 255)
-                  cv.drawCircle(cx, cy, r * 0.30f * pulse, p)
-                  p.color = 0xFFFFFFFF.toInt()
-                  cv.drawCircle(cx - r * 0.06f, cy - r * 0.06f, r * 0.10f * pulse, p)
-
-                  p.style = Paint.Style.STROKE
-                  p.strokeCap = Paint.Cap.ROUND
-                  for (k in 0 until 3) {
-                      val rr = r * (0.48f + 0.17f * k)
-                      p.strokeWidth = 3f
-                      p.color = alpha(col, 200 - 55 * k)
-                      cv.save()
-                      cv.rotate(t * 360f * (if (k % 2 == 0) 1 else -1) * (k + 1) / 2f, cx, cy)
-                      val box = RectF(cx - rr, cy - rr, cx + rr, cy + rr)
-                      cv.drawArc(box, 0f, 70f, false, p)
-                      cv.drawArc(box, 120f, 40f, false, p)
-                      cv.drawArc(box, 220f, 90f, false, p)
-                      cv.restore()
+                  val col = when (state) {
+                      "thinking" -> 0xFFFFB347.toInt()
+                      "speaking" -> 0xFF7DF9FF.toInt()
+                      else -> 0xFF2EC4FF.toInt()
                   }
+                  val drift = dens * (2f + 5f * energy)
+                  for (k in 0 until n) {
+                      px[k] = bx[k] + drift * sin(tt * 0.9f + k * 1.7f)
+                      py[k] = by[k] + drift * cos(tt * 0.7f + k * 2.3f)
+                  }
+
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeWidth = dens * 1f
+                  paint.color = alpha(col, (28 + 60 * energy).toInt())
+                  for (e in ea.indices) cv.drawLine(px[ea[e]], py[ea[e]], px[eb[e]], py[eb[e]], paint)
+
+                  paint.style = Paint.Style.FILL
+                  for (p in pulses) {
+                      val a = ea[p.e]
+                      val b = eb[p.e]
+                      val x = px[a] + (px[b] - px[a]) * p.p
+                      val y = py[a] + (py[b] - py[a]) * p.p
+                      paint.color = alpha(col, 70)
+                      cv.drawCircle(x, y, dens * 5f, paint)
+                      paint.color = alpha(col, 255)
+                      cv.drawCircle(x, y, dens * 2.2f, paint)
+                  }
+
+                  for (k in 0 until n) {
+                      val g = glow[k]
+                      paint.color = alpha(col, (50 * g).toInt())
+                      cv.drawCircle(px[k], py[k], dens * (7f + 9f * g), paint)
+                      paint.color = alpha(col, (110 + 145 * g).toInt())
+                      cv.drawCircle(px[k], py[k], dens * (3.5f + 3f * g), paint)
+                  }
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/SettingsActivity.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Spinner
+          import android.widget.TextView
+
+          class SettingsActivity : Activity() {
+
+              private lateinit var spinner: Spinner
+              private lateinit var keyBox: EditText
+              private lateinit var modelBox: EditText
+              private lateinit var baseBox: EditText
+              private lateinit var help: TextView
+              private lateinit var testOut: TextView
+              private var cur = ""
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = 12f
+                  t.letterSpacing = 0.12f
+                  t.setTextColor(0xFF2EC4FF.toInt())
+                  t.setPadding(0, dp(20), 0, dp(4))
+                  return t
+              }
+
+              private fun styled(text: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.setTextColor(0xFFE8F6FF.toInt())
+                  b.setBackgroundColor(0xFF0E2A3F.toInt())
+                  b.setOnClickListener { onClick() }
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52))
+                  lp.topMargin = dp(10)
+                  b.layoutParams = lp
+                  return b
+              }
+
+              private fun field(hint: String, password: Boolean): EditText {
+                  val e = EditText(this)
+                  e.hint = hint
+                  e.setTextColor(0xFFE8F6FF.toInt())
+                  e.setHintTextColor(0xFF5C7A90.toInt())
+                  e.setSingleLine(true)
+                  e.inputType = if (password) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+                  return e
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = 0xFF050A14.toInt()
+                  window.navigationBarColor = 0xFF050A14.toInt()
+
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(20), dp(8), dp(20), dp(32))
+
+                  val back = TextView(this)
+                  back.text = "←  Volver"
+                  back.textSize = 16f
+                  back.setTextColor(0xFF2EC4FF.toInt())
+                  back.setPadding(0, dp(12), dp(12), dp(12))
+                  back.setOnClickListener { finish() }
+                  col.addView(back)
+
+                  val title = TextView(this)
+                  title.text = "AJUSTES"
+                  title.textSize = 26f
+                  title.letterSpacing = 0.3f
+                  title.setTextColor(0xFFE8F6FF.toInt())
+                  title.gravity = Gravity.START
+                  col.addView(title)
+
+                  col.addView(label("CEREBRO (PROVEEDOR DE IA)"))
+                  spinner = Spinner(this)
+                  val ad = ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, Cfg.names)
+                  ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  spinner.adapter = ad
+                  col.addView(spinner)
+
+                  help = TextView(this)
+                  help.textSize = 12f
+                  help.setTextColor(0xFF8DA5B6.toInt())
+                  col.addView(help)
+
+                  col.addView(label("CLAVE API"))
+                  keyBox = field("Pegue aquí su clave", true)
+                  col.addView(keyBox)
+
+                  col.addView(label("MODELO"))
+                  modelBox = field("Nombre del modelo", false)
+                  col.addView(modelBox)
+
+                  col.addView(label("DIRECCIÓN DEL SERVICIO"))
+                  baseBox = field("https://api.openai.com/v1", false)
+                  baseBox.visibility = View.GONE
+                  col.addView(baseBox)
+
+                  col.addView(styled("Probar conexión") {
+                      saveFields(cur)
+                      testOut.text = "Probando…"
+                      val app = applicationContext
+                      Thread {
+                          val r = Brain(app).ask("Responde solo con: conexión lista.")
+                          runOnUiThread { testOut.text = r }
+                      }.start()
+                  })
+                  testOut = TextView(this)
+                  testOut.textSize = 14f
+                  testOut.setTextColor(0xFFB8CCDA.toInt())
+                  testOut.setPadding(0, dp(8), 0, 0)
+                  col.addView(testOut)
+
+                  col.addView(label("PERMISOS"))
+                  col.addView(styled("1 · Dar permisos") { askPermissions() })
+                  col.addView(styled("2 · Permitir abrir apps en segundo plano") {
+                      if (!Settings.canDrawOverlays(this)) {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      } else {
+                          testOut.text = "Ya está permitido, señor."
+                      }
+                  })
+                  col.addView(styled("3 · Quitar ahorro de batería") {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  })
+                  col.addView(styled("4 · Activar accesibilidad (tocar, escribir, WhatsApp)") {
+                      testOut.text = "Busque Cerberus en la lista y actívelo, señor."
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+
+                  val sv = ScrollView(this)
+                  sv.setBackgroundColor(0xFF050A14.toInt())
+                  sv.addView(col)
+                  setContentView(sv)
+
+                  spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                          if (cur.isNotEmpty()) saveFields(cur)
+                          cur = Cfg.ids[pos]
+                          loadFields(cur)
+                      }
+
+                      override fun onNothingSelected(parent: AdapterView<*>?) {}
+                  }
+                  spinner.setSelection(Cfg.ids.indexOf(Cfg.provider(this)).coerceAtLeast(0))
+              }
+
+              private fun loadFields(id: String) {
+                  keyBox.setText(Cfg.key(this, id))
+                  modelBox.setText(Cfg.model(this, id))
+                  baseBox.setText(Cfg.base(this, "custom"))
+                  baseBox.visibility = if (id == "custom") View.VISIBLE else View.GONE
+                  help.text = when (id) {
+                      "gemini" -> "Clave gratis en aistudio.google.com/apikey (empieza con AIza)."
+                      "groq" -> "Clave gratis en console.groq.com/keys (empieza con gsk_)."
+                      "openrouter" -> "Clave en openrouter.ai/keys. Los modelos que terminan en :free no cuestan."
+                      else -> "Cualquier servicio compatible con OpenAI: escriba su dirección base, clave y modelo."
+                  }
+                  testOut.text = ""
+              }
+
+              private fun saveFields(id: String) {
+                  val e = Cfg.prefs(this).edit()
+                  e.putString("key_" + id, keyBox.text.toString().trim())
+                  e.putString("model_" + id, modelBox.text.toString().trim())
+                  if (id == "custom") e.putString("base_custom", baseBox.text.toString().trim())
+                  e.putString("provider", id)
+                  e.apply()
+              }
+
+              override fun onPause() {
+                  if (cur.isNotEmpty()) saveFields(cur)
+                  super.onPause()
+              }
+
+              private fun askPermissions() {
+                  val list = arrayListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.READ_CONTACTS,
+                      Manifest.permission.ANSWER_PHONE_CALLS,
+                      Manifest.permission.READ_PHONE_STATE,
+                      Manifest.permission.READ_CALL_LOG
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
+                  requestPermissions(list.toTypedArray(), 7)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  testOut.text = "Permisos procesados, señor."
               }
           }
           CERBEOF
