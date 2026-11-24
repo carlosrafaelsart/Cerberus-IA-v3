@@ -100,13 +100,16 @@ jobs:
 
               <application
                   android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
                   android:label="Cerberus"
                   android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
-                      android:launchMode="singleTask">
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
@@ -158,6 +161,21 @@ jobs:
           <resources>
               <string name="acc_desc">Permite a Cerberus tocar botones, escribir, desplazar la pantalla y enviar mensajes por orden de voz del señor.</string>
           </resources>
+          CERBEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'CERBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_bg">#171E28</color>
+          </resources>
+          CERBEOF
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'CERBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_bg" />
+              <foreground android:drawable="@drawable/ic_fg" />
+          </adaptive-icon>
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
           cat > app/src/main/java/com/carlosart/cerberus/Actions.kt <<'CERBEOF'
@@ -304,11 +322,6 @@ jobs:
 
                   Regex("^(llama|llamar|marca) (a |al )?(.+)$").find(t)?.let {
                       return call(it.groupValues[3])
-                  }
-
-                  Regex("^(busca|googlea|investiga) (en google |en internet )?(.+)$").find(t)?.let {
-                      val q = URLEncoder.encode(it.groupValues[3], "UTF-8")
-                      return launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=$q")), "Buscando, señor.")
                   }
 
                   Regex("^(abre|abrir|abra|inicia|lanza|ejecuta) (.+)$").find(t)?.let {
@@ -580,6 +593,9 @@ jobs:
           import org.json.JSONObject
           import java.net.HttpURLConnection
           import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           object Bus {
               @Volatile var listener: ((String, String) -> Unit)? = null
@@ -599,6 +615,8 @@ jobs:
               val names = arrayOf("Gemini (Google)", "Groq", "OpenRouter", "Otro (compatible con OpenAI)")
 
               fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("cerberus", 0)
+
+              fun webOn(c: Context): Boolean = prefs(c).getBoolean("web", true)
 
               fun provider(c: Context): String = prefs(c).getString("provider", "gemini") ?: "gemini"
 
@@ -642,7 +660,13 @@ jobs:
               private fun system(): String {
                   val facts = Store.facts(ctx)
                   val extra = if (facts.isEmpty()) "" else " Datos que recuerdas sobre el señor: " + facts.joinToString("; ") + "."
-                  return base + extra
+                  val now = SimpleDateFormat("EEEE d 'de' MMMM 'de' yyyy, HH:mm", Locale("es")).format(Date())
+                  val web = if (Cfg.webOn(ctx))
+                      " Tienes acceso a internet mediante búsqueda. Úsala siempre que el señor diga busca o investiga, y para " +
+                          "noticias, clima, precios, deportes, datos recientes o cualquier cosa de la que no estés seguro. " +
+                          "Resume lo encontrado en 1 a 3 frases."
+                  else ""
+                  return base + " Fecha y hora actuales: " + now + "." + web + extra
               }
 
               private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
@@ -670,6 +694,15 @@ jobs:
                   return "Señor, error " + code + (if (d.isNotEmpty()) ": " + d else "") + "."
               }
 
+              private fun searchTool(): JSONArray {
+                  val props = JSONObject().put("query", JSONObject().put("type", "string").put("description", "texto a buscar en internet"))
+                  val params = JSONObject().put("type", "object").put("properties", props).put("required", JSONArray().put("query"))
+                  val fn = JSONObject().put("name", "web_search")
+                      .put("description", "Busca información actual en internet: noticias, clima, precios, deportes, datos recientes.")
+                      .put("parameters", params)
+                  return JSONArray().put(JSONObject().put("type", "function").put("function", fn))
+              }
+
               fun ask(user: String, att: Attachment? = null): String {
                   val prov = Cfg.provider(ctx)
                   val key = Cfg.key(ctx, prov)
@@ -684,6 +717,7 @@ jobs:
                   val attMime = att?.mime ?: ""
                   val prompt = if (fileText != null) "Contenido del archivo \"" + attName + "\":\n" + fileText + "\n\n" + user else user
                   val sys = system()
+                  val web = Cfg.webOn(ctx)
 
                   try {
                       var ans = ""
@@ -698,13 +732,19 @@ jobs:
                               parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", attMime).put("data", b64)))
                           }
                           contents.put(JSONObject().put("role", "user").put("parts", parts))
-                          val body = JSONObject()
-                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
-                              .put("contents", contents)
-                          val res = post(
-                              "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-                              mapOf("x-goog-api-key" to key), body
-                          )
+                          val url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+
+                          fun call(withSearch: Boolean): Pair<Int, String> {
+                              val body = JSONObject()
+                                  .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+                                  .put("contents", contents)
+                              if (withSearch) body.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
+                              return post(url, mapOf("x-goog-api-key" to key), body)
+                          }
+
+                          if (web) Bus.emit("thinking", "Pensando…")
+                          var res = call(web)
+                          if (web && res.first in 400..404) res = call(false)
                           if (res.first !in 200..299) return errMsg(res.first, res.second)
                           val rp = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
                               .getJSONObject("content").getJSONArray("parts")
@@ -727,14 +767,42 @@ jobs:
                           } else {
                               msgs.put(JSONObject().put("role", "user").put("content", prompt))
                           }
-                          val body = JSONObject().put("model", model).put("messages", msgs)
-                          val res = post(
-                              baseUrl + "/chat/completions",
-                              mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus"), body
-                          )
-                          if (res.first !in 200..299) return errMsg(res.first, res.second)
-                          val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
-                          ans = if (msg.isNull("content")) "" else msg.getString("content")
+                          val headers = mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus")
+                          var useTools = web && b64 == null
+                          var finished = false
+                          var round = 0
+                          while (!finished && round < 4) {
+                              val body = JSONObject().put("model", model).put("messages", msgs)
+                              val tools = useTools && round < 3
+                              if (tools) body.put("tools", searchTool())
+                              val res = post(baseUrl + "/chat/completions", headers, body)
+                              if (res.first !in 200..299) {
+                                  if (tools && res.first in 400..404) { useTools = false; continue }
+                                  return errMsg(res.first, res.second)
+                              }
+                              val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+                              val calls = msg.optJSONArray("tool_calls")
+                              if (tools && calls != null && calls.length() > 0) {
+                                  msgs.put(msg)
+                                  for (k in 0 until calls.length()) {
+                                      val call = calls.getJSONObject(k)
+                                      val args = try {
+                                          JSONObject(call.getJSONObject("function").optString("arguments", "{}"))
+                                      } catch (e: Exception) {
+                                          JSONObject()
+                                      }
+                                      val q = args.optString("query", user)
+                                      Bus.emit("thinking", "Buscando en internet…")
+                                      msgs.put(JSONObject().put("role", "tool")
+                                          .put("tool_call_id", call.optString("id"))
+                                          .put("content", Search.web(q)))
+                                  }
+                                  round++
+                                  continue
+                              }
+                              ans = if (msg.isNull("content")) "" else msg.getString("content")
+                              finished = true
+                          }
                       }
                       ans = ans.replace("*", "").trim()
                       if (ans.isEmpty()) return "Señor, no obtuve respuesta."
@@ -853,6 +921,8 @@ jobs:
           import android.content.Intent
           import android.content.IntentFilter
           import android.content.pm.ServiceInfo
+          import android.media.AudioManager
+          import android.media.ToneGenerator
           import android.os.Build
           import android.os.Bundle
           import android.os.Handler
@@ -877,8 +947,10 @@ jobs:
               private lateinit var actions: Actions
               private lateinit var brain: Brain
               private var speaking = false
+              private var listening = false
               private var stopped = false
               private var awakeUntil = 0L
+              private var lastEvent = 0L
 
               override fun onBind(intent: Intent?): IBinder? = null
 
@@ -893,9 +965,14 @@ jobs:
                   else registerReceiver(phoneRx, f)
                   Bus.running = true
                   Bus.emit("idle", "Cerberus en línea.")
+                  main.postDelayed({ watchdog() }, 15000)
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "ASK_TEXT") {
+                      val q = intent.getStringExtra("text") ?: ""
+                      if (q.isNotBlank()) main.post { execute(q) }
+                  }
                   if (intent?.action == "ASK_ATTACH") {
                       val prompt = intent.getStringExtra("prompt") ?: "Describe esto."
                       Bus.emit("thinking", "Analizando…")
@@ -931,6 +1008,8 @@ jobs:
                   }
               }
 
+              // ---------------- voz (salida) ----------------
+
               override fun onInit(status: Int) {
                   val t = tts ?: return
                   val prefs = Cfg.prefs(this)
@@ -960,7 +1039,8 @@ jobs:
                   main.post {
                       speaking = false
                       Bus.level = 0f
-                      awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + 6000)
+                      // tras responder, puede seguir hablando 10 s sin repetir el nombre
+                      awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + 10000)
                       Bus.emit("idle", "")
                       listen()
                   }
@@ -970,75 +1050,178 @@ jobs:
                   val t = tts
                   if (!ttsReady || t == null) { Bus.emit("idle", text); listen(); return }
                   speaking = true
-                  rec?.cancel()
+                  listening = false
+                  try { rec?.cancel() } catch (e: Exception) { }
                   Bus.emit("speaking", text)
                   t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "cerberus")
               }
 
-              private fun listen() {
+              private fun beep() {
+                  try {
+                      val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
+                      tg.startTone(ToneGenerator.TONE_PROP_ACK, 140)
+                      main.postDelayed({ try { tg.release() } catch (e: Exception) { } }, 500)
+                  } catch (e: Exception) { }
+              }
+
+              // ---------------- voz (entrada) ----------------
+
+              private fun recIntent(): Intent {
+                  val dev = Locale.getDefault()
+                  val tag = if (dev.language == "es") dev.toLanguageTag() else "es-ES"
+                  val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
+                      .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+                      .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                      .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+                      .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, arrayListOf("Cerberus"))
+                  }
+                  return i
+              }
+
+              private fun listen(delayMs: Long = 0L) {
                   if (stopped) return
-                  main.post {
-                      if (stopped || speaking) return@post
-                      if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-                          Bus.emit("idle", "Reconocimiento de voz no disponible en este teléfono.")
-                          return@post
-                      }
-                      rec?.destroy()
-                      val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  main.postDelayed({ startNow() }, delayMs)
+              }
+
+              private fun startNow() {
+                  if (stopped || speaking || listening) return
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      Bus.emit("idle", "Reconocimiento de voz no disponible en este teléfono.")
+                      return
+                  }
+                  var r = rec
+                  if (r == null) {
+                      r = SpeechRecognizer.createSpeechRecognizer(this)
                       r.setRecognitionListener(listener)
                       rec = r
-                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-ES")
-                          .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-                      r.startListening(i)
-                      val awake = System.currentTimeMillis() < awakeUntil
-                      Bus.emit("listening", if (awake) "Escuchando…" else "Diga \"Cerberus\"…")
                   }
+                  try {
+                      r.startListening(recIntent())
+                      listening = true
+                      lastEvent = System.currentTimeMillis()
+                  } catch (e: Exception) {
+                      try { r.destroy() } catch (x: Exception) { }
+                      rec = null
+                      listening = false
+                      listen(600)
+                      return
+                  }
+                  val awake = System.currentTimeMillis() < awakeUntil
+                  Bus.emit("listening", if (awake) "Escuchando…" else "Diga \"Cerberus\"…")
+              }
+
+              /** Si el reconocedor se queda mudo sin avisar, lo reinicia. */
+              private fun watchdog() {
+                  if (stopped) return
+                  if (!speaking && listening && System.currentTimeMillis() - lastEvent > 20000) {
+                      try { rec?.destroy() } catch (e: Exception) { }
+                      rec = null
+                      listening = false
+                      startNow()
+                  }
+                  main.postDelayed({ watchdog() }, 15000)
               }
 
               private val listener = object : RecognitionListener {
-                  override fun onReadyForSpeech(params: Bundle?) {}
-                  override fun onBeginningOfSpeech() {}
-                  override fun onRmsChanged(rmsdB: Float) { Bus.level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f) }
+                  override fun onReadyForSpeech(params: Bundle?) { lastEvent = System.currentTimeMillis() }
+                  override fun onBeginningOfSpeech() { lastEvent = System.currentTimeMillis() }
+                  override fun onRmsChanged(rmsdB: Float) {
+                      lastEvent = System.currentTimeMillis()
+                      Bus.level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                  }
                   override fun onBufferReceived(buffer: ByteArray?) {}
                   override fun onEndOfSpeech() {}
                   override fun onPartialResults(partialResults: Bundle?) {}
                   override fun onEvent(eventType: Int, params: Bundle?) {}
 
                   override fun onError(error: Int) {
+                      listening = false
+                      lastEvent = System.currentTimeMillis()
                       if (stopped || speaking) return
                       when (error) {
-                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                          SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
                               Bus.emit("idle", "Falta el permiso de micrófono, señor.")
+                          SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                              try { rec?.cancel() } catch (e: Exception) { }
+                              listen(400)
                           }
-                          SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> main.postDelayed({ listen() }, 1200)
-                          else -> main.postDelayed({ listen() }, 250)
+                          SpeechRecognizer.ERROR_CLIENT,
+                          SpeechRecognizer.ERROR_SERVER,
+                          SpeechRecognizer.ERROR_NETWORK,
+                          SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
+                              try { rec?.destroy() } catch (e: Exception) { }
+                              rec = null
+                              listen(700)
+                          }
+                          else -> listen(80) // sin voz o sin coincidencia: vuelve a escuchar enseguida
                       }
                   }
 
                   override fun onResults(results: Bundle?) {
-                      val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                      if (text.isNullOrBlank()) { listen(); return }
-                      handle(text)
+                      listening = false
+                      lastEvent = System.currentTimeMillis()
+                      handleList(results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION))
                   }
               }
 
-              private fun handle(text: String) {
-                  val low = text.lowercase(Locale.ROOT)
-                  val m = Regex("cerberus|cerbero|cerveros?|cerberos|servers").find(low)
-                  val now = System.currentTimeMillis()
-                  when {
-                      m != null -> {
-                          val cmd = low.substring(m.range.last + 1).trim(' ', ',', '.', ':')
-                          if (cmd.isEmpty()) {
-                              awakeUntil = now + 8000
-                              say("A sus órdenes, señor.")
-                          } else execute(cmd)
-                      }
-                      now < awakeUntil -> execute(low)
-                      else -> listen()
+              // ---------------- palabra de activación ----------------
+
+              private fun lev(a: String, b: String): Int {
+                  val d = Array(a.length + 1) { IntArray(b.length + 1) }
+                  for (i in 0..a.length) d[i][0] = i
+                  for (j in 0..b.length) d[0][j] = j
+                  for (i in 1..a.length) for (j in 1..b.length) {
+                      val c = if (a[i - 1] == b[j - 1]) 0 else 1
+                      d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + c)
                   }
+                  return d[a.length][b.length]
+              }
+
+              private val wakeAlias = setOf(
+                  "servers", "serverus", "cervelus", "cerbero", "cerberos", "cervero", "cerveros",
+                  "kerberus", "cerberu", "cerbers", "cerverus", "cerbelus", "serberus", "cerberoz"
+              )
+
+              private fun isWake(w: String): Boolean {
+                  val n = Actions.norm(w).replace(" ", "")
+                  if (n.length < 5 || n.length > 10) return false
+                  return n in wakeAlias || n.startsWith("cerber") || lev(n, "cerberus") <= 2
+              }
+
+              /** Devuelve dónde termina la palabra de activación dentro del texto, o -1 si no está. */
+              private fun findWake(low: String): Int {
+                  val ms = Regex("[a-záéíóúñü]+").findAll(low).toList()
+                  for (i in ms.indices) {
+                      if (isWake(ms[i].value)) return ms[i].range.last + 1
+                      if (i + 1 < ms.size && isWake(ms[i].value + ms[i + 1].value)) return ms[i + 1].range.last + 1
+                  }
+                  return -1
+              }
+
+              private fun handleList(list: List<String>?) {
+                  if (list.isNullOrEmpty()) { listen(); return }
+                  val now = System.currentTimeMillis()
+                  for (t in list) {
+                      val low = t.lowercase(Locale.ROOT)
+                      val e = findWake(low)
+                      if (e >= 0) {
+                          val cmd = low.substring(e).trim(' ', ',', '.', ':', '¿', '?', '!')
+                          if (cmd.isEmpty()) {
+                              awakeUntil = now + 10000
+                              beep()
+                              Bus.emit("listening", "Dígame, señor…")
+                              listen()
+                          } else {
+                              execute(cmd)
+                          }
+                          return
+                      }
+                  }
+                  if (now < awakeUntil) execute(list[0]) else listen()
               }
 
               private fun execute(cmd: String) {
@@ -1064,11 +1247,41 @@ jobs:
                   stopped = true
                   Bus.running = false
                   try { unregisterReceiver(phoneRx) } catch (e: Exception) {}
-                  rec?.destroy()
+                  try { rec?.destroy() } catch (e: Exception) {}
                   tts?.shutdown()
                   io.shutdownNow()
                   Bus.emit("idle", "Cerberus desactivado.")
                   super.onDestroy()
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/ClockIcon.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Paint
+          import android.view.View
+          import kotlin.math.min
+
+          /** Reloj pequeño dibujado a mano: abre el historial. */
+          class ClockIcon(c: Context) : View(c) {
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val d = c.resources.displayMetrics.density
+
+              override fun onDraw(cv: Canvas) {
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(cx, cy) - d * 1.5f
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.strokeWidth = d * 2f
+                  p.color = 0xFF2EC4FF.toInt()
+                  cv.drawCircle(cx, cy, r, p)
+                  cv.drawLine(cx, cy, cx, cy - r * 0.58f, p)
+                  cv.drawLine(cx, cy, cx + r * 0.42f, cy + r * 0.12f, p)
               }
           }
           CERBEOF
@@ -1206,15 +1419,19 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.ContentValues
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.MediaStore
           import android.view.Gravity
           import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
           import android.widget.Button
           import android.widget.EditText
           import android.widget.LinearLayout
@@ -1226,18 +1443,25 @@ jobs:
               private lateinit var status: TextView
               private lateinit var brainLine: TextView
               private lateinit var toggle: Button
+              private lateinit var input: EditText
               private var camUri: Uri? = null
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-              private fun link(text: String, onClick: () -> Unit): TextView {
-                  val t = TextView(this)
-                  t.text = text
-                  t.textSize = 16f
-                  t.setTextColor(0xFF2EC4FF.toInt())
-                  t.setPadding(dp(12), dp(12), dp(12), dp(12))
-                  t.setOnClickListener { onClick() }
-                  return t
+              private fun pill(fill: Int, stroke: Int, radiusDp: Int): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.setColor(fill)
+                  g.cornerRadius = dp(radiusDp).toFloat()
+                  if (stroke != 0) g.setStroke(dp(1), stroke)
+                  return g
+              }
+
+              private fun circle(fill: Int, stroke: Int): GradientDrawable {
+                  val g = GradientDrawable()
+                  g.shape = GradientDrawable.OVAL
+                  g.setColor(fill)
+                  if (stroke != 0) g.setStroke(dp(1), stroke)
+                  return g
               }
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -1248,72 +1472,128 @@ jobs:
                   val root = LinearLayout(this)
                   root.orientation = LinearLayout.VERTICAL
                   root.setBackgroundColor(0xFF050A14.toInt())
-                  root.setPadding(dp(20), dp(8), dp(20), dp(24))
+                  root.setPadding(dp(16), dp(4), dp(16), dp(14))
 
+                  // --- barra superior: reloj (historial) a la izquierda, engranaje a la derecha ---
                   val top = LinearLayout(this)
                   top.orientation = LinearLayout.HORIZONTAL
-                  top.addView(link("Historial") { startActivity(Intent(this, HistoryActivity::class.java)) })
+                  top.gravity = Gravity.CENTER_VERTICAL
+
+                  val clock = ClockIcon(this)
+                  clock.contentDescription = "Historial"
+                  clock.setPadding(dp(10), dp(10), dp(10), dp(10))
+                  clock.setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
+                  top.addView(clock, LinearLayout.LayoutParams(dp(46), dp(46)))
+
                   top.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-                  top.addView(link("⚙  Ajustes") { startActivity(Intent(this, SettingsActivity::class.java)) })
+
+                  val gear = TextView(this)
+                  gear.text = "⚙"
+                  gear.textSize = 26f
+                  gear.gravity = Gravity.CENTER
+                  gear.setTextColor(0xFF2EC4FF.toInt())
+                  gear.contentDescription = "Ajustes"
+                  gear.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
+                  top.addView(gear, LinearLayout.LayoutParams(dp(46), dp(46)))
+
                   root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
+                  // --- red neuronal ---
                   neural = NeuralView(this)
-                  root.addView(neural, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(260)))
+                  root.addView(neural, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.25f))
 
+                  // --- nombre pequeño ---
                   val title = TextView(this)
                   title.text = "CERBERUS"
-                  title.textSize = 30f
-                  title.letterSpacing = 0.35f
+                  title.textSize = 15f
+                  title.letterSpacing = 0.4f
                   title.typeface = Typeface.DEFAULT_BOLD
                   title.setTextColor(0xFFE8F6FF.toInt())
                   title.gravity = Gravity.CENTER
-                  title.setPadding(0, dp(12), 0, 0)
                   root.addView(title)
 
                   val sub = TextView(this)
-                  sub.text = "ASISTENTE PERSONAL CON IA · CREADO POR CARLOSART"
-                  sub.textSize = 10f
-                  sub.letterSpacing = 0.15f
+                  sub.text = "CREADO POR CARLOSART"
+                  sub.textSize = 9f
+                  sub.letterSpacing = 0.2f
                   sub.setTextColor(0xFF2EC4FF.toInt())
                   sub.gravity = Gravity.CENTER
                   root.addView(sub)
 
                   brainLine = TextView(this)
-                  brainLine.textSize = 12f
-                  brainLine.setTextColor(0xFF5C7A90.toInt())
+                  brainLine.textSize = 10f
+                  brainLine.setTextColor(0xFF4F6A7D.toInt())
                   brainLine.gravity = Gravity.CENTER
-                  brainLine.setPadding(0, dp(6), 0, 0)
+                  brainLine.setPadding(0, dp(2), 0, 0)
                   root.addView(brainLine)
 
+                  // --- estado / última respuesta ---
                   status = TextView(this)
                   status.text = "A sus órdenes, señor."
-                  status.textSize = 17f
+                  status.textSize = 16f
                   status.setTextColor(0xFFB8CCDA.toInt())
                   status.gravity = Gravity.CENTER
                   status.setPadding(dp(8), dp(8), dp(8), dp(8))
-                  root.addView(status, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+                  root.addView(status, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.75f))
 
-                  val bottom = LinearLayout(this)
-                  bottom.orientation = LinearLayout.HORIZONTAL
-
-                  val plus = Button(this)
-                  plus.text = "+"
-                  plus.textSize = 28f
-                  plus.setTextColor(0xFF2EC4FF.toInt())
-                  plus.setBackgroundColor(0xFF0E2A3F.toInt())
-                  plus.setOnClickListener { showPlusMenu() }
-                  bottom.addView(plus, LinearLayout.LayoutParams(dp(64), dp(60)))
-
+                  // --- botón Activar pequeño ---
                   toggle = Button(this)
+                  toggle.textSize = 13f
+                  toggle.transformationMethod = null
                   toggle.setTextColor(0xFFE8F6FF.toInt())
-                  toggle.setBackgroundColor(0xFF0E2A3F.toInt())
-                  toggle.textSize = 17f
+                  toggle.background = pill(0xFF0C1824.toInt(), 0xFF2EC4FF.toInt(), 20)
+                  toggle.setPadding(dp(26), 0, dp(26), 0)
                   toggle.setOnClickListener { toggleService() }
-                  val tlp = LinearLayout.LayoutParams(0, dp(60), 1f)
-                  tlp.leftMargin = dp(10)
-                  bottom.addView(toggle, tlp)
+                  val tl = LinearLayout(this)
+                  tl.gravity = Gravity.CENTER
+                  tl.addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
+                  root.addView(tl, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-                  root.addView(bottom, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  // --- barra de escritura: + | texto | enviar ---
+                  val bar = LinearLayout(this)
+                  bar.orientation = LinearLayout.HORIZONTAL
+                  bar.gravity = Gravity.CENTER_VERTICAL
+                  bar.setPadding(0, dp(10), 0, 0)
+
+                  val plus = TextView(this)
+                  plus.text = "+"
+                  plus.textSize = 26f
+                  plus.gravity = Gravity.CENTER
+                  plus.setTextColor(0xFF2EC4FF.toInt())
+                  plus.background = circle(0xFF0C1824.toInt(), 0xFF1C3347.toInt())
+                  plus.contentDescription = "Adjuntar"
+                  plus.setOnClickListener { showPlusMenu() }
+                  bar.addView(plus, LinearLayout.LayoutParams(dp(46), dp(46)))
+
+                  input = EditText(this)
+                  input.hint = "Escríbale a Cerberus…"
+                  input.setHintTextColor(0xFF5C7A90.toInt())
+                  input.setTextColor(0xFFE8F6FF.toInt())
+                  input.textSize = 15f
+                  input.setSingleLine(true)
+                  input.imeOptions = EditorInfo.IME_ACTION_SEND
+                  input.background = pill(0xFF0C1824.toInt(), 0xFF1C3347.toInt(), 23)
+                  input.setPadding(dp(18), 0, dp(18), 0)
+                  input.setOnEditorActionListener { _, id, _ ->
+                      if (id == EditorInfo.IME_ACTION_SEND) { sendText(); true } else false
+                  }
+                  val ilp = LinearLayout.LayoutParams(0, dp(46), 1f)
+                  ilp.leftMargin = dp(8)
+                  ilp.rightMargin = dp(8)
+                  bar.addView(input, ilp)
+
+                  val send = TextView(this)
+                  send.text = "↑"
+                  send.textSize = 22f
+                  send.typeface = Typeface.DEFAULT_BOLD
+                  send.gravity = Gravity.CENTER
+                  send.setTextColor(0xFF04131D.toInt())
+                  send.background = circle(0xFF2EC4FF.toInt(), 0)
+                  send.contentDescription = "Enviar"
+                  send.setOnClickListener { sendText() }
+                  bar.addView(send, LinearLayout.LayoutParams(dp(46), dp(46)))
+
+                  root.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
                   setContentView(root)
               }
@@ -1325,9 +1605,9 @@ jobs:
                       if (text.isNotEmpty()) status.text = text
                   }
                   val prov = Cfg.provider(this)
-                  brainLine.text = "Cerebro: " + Cfg.name(prov) + " · " + Cfg.model(this, prov).ifEmpty { "sin modelo" }
+                  brainLine.text = Cfg.name(prov) + " · " + Cfg.model(this, prov).ifEmpty { "sin modelo" }
                   if (Cfg.key(this, prov).isEmpty() && !Bus.running) {
-                      status.text = "Toque Ajustes y configure su clave, señor."
+                      status.text = "Toque ⚙ y configure su clave, señor."
                   }
                   neural.state = if (Bus.running) "listening" else "idle"
                   refreshButton()
@@ -1339,7 +1619,7 @@ jobs:
               }
 
               private fun refreshButton() {
-                  toggle.text = if (Bus.running) "Desactivar Cerberus" else "Activar Cerberus"
+                  toggle.text = if (Bus.running) "Detener" else "Activar"
               }
 
               private fun hasMic() =
@@ -1353,7 +1633,7 @@ jobs:
                       status.text = "Cerberus desactivado."
                   } else {
                       if (!hasMic()) {
-                          status.text = "Necesito permisos, señor. Acéptelos o use Ajustes."
+                          status.text = "Necesito permisos, señor. Acéptelos o use ⚙."
                           askPermissions()
                           return
                       }
@@ -1361,6 +1641,35 @@ jobs:
                       Bus.running = true
                   }
                   refreshButton()
+              }
+
+              // ---------- escribirle a Cerberus ----------
+
+              private fun sendText() {
+                  val q = input.text.toString().trim()
+                  if (q.isEmpty()) return
+                  input.setText("")
+                  try {
+                      (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                          .hideSoftInputFromWindow(input.windowToken, 0)
+                  } catch (e: Exception) { }
+                  status.text = q
+                  neural.state = "thinking"
+                  if (Bus.running) {
+                      val i = Intent(this, CerberusService::class.java)
+                      i.action = "ASK_TEXT"
+                      i.putExtra("text", q)
+                      startService(i)
+                  } else {
+                      val app = applicationContext
+                      Thread {
+                          val ans = Actions(app).tryHandle(q) ?: Brain(app).ask(q)
+                          runOnUiThread {
+                              neural.state = "idle"
+                              status.text = ans
+                          }
+                      }.start()
+                  }
               }
 
               // ---------- botón + : fotos, cámara y archivos ----------
@@ -1480,12 +1789,15 @@ jobs:
           import kotlin.math.cos
           import kotlin.math.exp
           import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
           import kotlin.math.sin
           import kotlin.random.Random
 
           /**
-           * Red neuronal animada. Las señales viajan de la capa de entrada a la de salida.
-           * - Hablando: cada palabra de Cerberus lanza una ráfaga de impulsos.
+           * Red neuronal en anillos concéntricos que giran lentamente en sentidos opuestos.
+           * Los impulsos nacen en el anillo interior y viajan hacia afuera.
+           * - Hablando: cada palabra de Cerberus lanza una ráfaga.
            * - Escuchando: la intensidad sigue el volumen de su voz.
            * - Pensando: actividad rápida y constante en ámbar.
            */
@@ -1493,16 +1805,19 @@ jobs:
 
               var state: String = "idle"
 
-              private val layers = intArrayOf(3, 5, 6, 5, 3)
-              private val n = layers.sum()
-              private val layerOf = IntArray(n)
-              private val idxIn = IntArray(n)
+              private val counts = intArrayOf(12, 16, 20, 26, 32)
+              private val fracs = floatArrayOf(0.30f, 0.42f, 0.56f, 0.73f, 0.93f)
+              private val rings = counts.size
+              private val n = counts.sum()
+              private val ringStart = IntArray(rings)
+              private val ringOf = IntArray(n)
+              private val idxOf = IntArray(n)
+              private val scale = FloatArray(n)
+              private val ang = FloatArray(rings)
               private val ea = ArrayList<Int>()
               private val eb = ArrayList<Int>()
               private val from = Array(n) { ArrayList<Int>() }
               private val inputEdges = ArrayList<Int>()
-              private val bx = FloatArray(n)
-              private val by = FloatArray(n)
               private val px = FloatArray(n)
               private val py = FloatArray(n)
               private val glow = FloatArray(n)
@@ -1524,48 +1839,53 @@ jobs:
                   addUpdateListener { step(); invalidate() }
               }
 
+              private fun addEdge(a: Int, b: Int): Int {
+                  ea.add(a)
+                  eb.add(b)
+                  from[a].add(ea.size - 1)
+                  return ea.size - 1
+              }
+
               init {
                   var k = 0
-                  for (l in layers.indices) for (i in 0 until layers[l]) {
-                      layerOf[k] = l
-                      idxIn[k] = i
-                      k++
-                  }
-                  var start = 0
-                  for (l in 0 until layers.size - 1) {
-                      val next = start + layers[l]
-                      for (i in 0 until layers[l]) for (j in 0 until layers[l + 1]) {
-                          val a = start + i
-                          val b = next + j
-                          ea.add(a)
-                          eb.add(b)
-                          from[a].add(ea.size - 1)
-                          if (l == 0) inputEdges.add(ea.size - 1)
+                  for (r in 0 until rings) {
+                      ringStart[r] = k
+                      for (i in 0 until counts[r]) {
+                          ringOf[k] = r
+                          idxOf[k] = i
+                          scale[k] = 0.7f + Random.nextFloat() * 0.8f
+                          k++
                       }
-                      start = next
+                      ang[r] = r * 0.7f
+                  }
+                  for (r in 0 until rings) {
+                      val cnt = counts[r]
+                      for (i in 0 until cnt) {
+                          val a = ringStart[r] + i
+                          addEdge(a, ringStart[r] + (i + 1) % cnt)
+                          if (r < rings - 1) {
+                              val nc = counts[r + 1]
+                              val j = (i * nc / cnt.toFloat()).roundToInt()
+                              val e1 = addEdge(a, ringStart[r + 1] + j % nc)
+                              val e2 = addEdge(a, ringStart[r + 1] + (j + 1) % nc)
+                              if (r == 0) {
+                                  inputEdges.add(e1)
+                                  inputEdges.add(e2)
+                              }
+                          }
+                      }
                   }
               }
 
               override fun onAttachedToWindow() { super.onAttachedToWindow(); last = 0L; anim.start() }
               override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
 
-              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
-                  super.onSizeChanged(w, h, ow, oh)
-                  val padX = dens * 18f
-                  val padY = dens * 16f
-                  for (k in 0 until n) {
-                      val l = layerOf[k]
-                      bx[k] = padX + (w - 2f * padX) * l / (layers.size - 1f)
-                      by[k] = padY + (h - 2f * padY) * (idxIn[k] + 1f) / (layers[l] + 1f)
-                  }
-              }
-
-              private fun speed(): Float = 1.0f + energy * 2.2f + Random.nextFloat() * 0.6f
+              private fun speed(): Float = 0.9f + energy * 2.0f + Random.nextFloat() * 0.6f
 
               private fun spawn() {
-                  if (pulses.size >= 160) return
+                  if (pulses.size >= 200) return
                   val e = inputEdges[Random.nextInt(inputEdges.size)]
-                  glow[ea[e]] = 0.8f
+                  glow[ea[e]] = 0.9f
                   pulses.add(Pulse(e, 0f, speed()))
               }
 
@@ -1584,12 +1904,16 @@ jobs:
                   }
                   if (Bus.kickAt != lastKick) {
                       lastKick = Bus.kickAt
-                      if (state == "speaking") repeat(5) { spawn() }
+                      if (state == "speaking") repeat(6) { spawn() }
                   }
 
-                  for (i in 0 until n) glow[i] = max(0f, glow[i] - dt * 2.2f)
+                  for (r in 0 until rings) {
+                      val dir = if (r % 2 == 0) 1f else -1f
+                      ang[r] += dir * (0.06f + 0.025f * r) * (1f + 2.5f * energy) * dt
+                  }
+                  for (i in 0 until n) glow[i] = max(0f, glow[i] - dt * 2.0f)
 
-                  spawnAcc += energy * 36f * dt
+                  spawnAcc += energy * 34f * dt
                   while (spawnAcc >= 1f) {
                       spawnAcc -= 1f
                       spawn()
@@ -1605,8 +1929,8 @@ jobs:
                           glow[b] = 1f
                           iter.remove()
                           val out = from[b]
-                          if (out.isNotEmpty() && pulses.size + born.size < 160 &&
-                              Random.nextFloat() < 0.5f + 0.4f * energy
+                          if (out.isNotEmpty() && pulses.size + born.size < 200 &&
+                              Random.nextFloat() < 0.55f + 0.4f * energy
                           ) {
                               born.add(Pulse(out[Random.nextInt(out.size)], 0f, speed()))
                           }
@@ -1623,16 +1947,35 @@ jobs:
                       "speaking" -> 0xFF7DF9FF.toInt()
                       else -> 0xFF2EC4FF.toInt()
                   }
-                  val drift = dens * (2f + 5f * energy)
+                  val core = if (state == "thinking") 0xFFFFEBCF.toInt() else 0xFFEAFFFF.toInt()
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val big = min(cx, cy) - dens * 6f
+
                   for (k in 0 until n) {
-                      px[k] = bx[k] + drift * sin(tt * 0.9f + k * 1.7f)
-                      py[k] = by[k] + drift * cos(tt * 0.7f + k * 2.3f)
+                      val r = ringOf[k]
+                      val a = ang[r] + 2f * Math.PI.toFloat() * idxOf[k] / counts[r]
+                      val rad = big * fracs[r] * (1f + 0.025f * sin(tt * 1.2f + k) + 0.03f * energy)
+                      px[k] = cx + rad * cos(a)
+                      py[k] = cy + rad * sin(a)
+                  }
+
+                  // brillo suave en el centro vacío
+                  paint.style = Paint.Style.FILL
+                  for (i in 0 until 6) {
+                      paint.color = alpha(col, (5 + 22 * energy).toInt())
+                      cv.drawCircle(cx, cy, big * 0.27f * (1f - i / 6f), paint)
                   }
 
                   paint.style = Paint.Style.STROKE
-                  paint.strokeWidth = dens * 1f
-                  paint.color = alpha(col, (28 + 60 * energy).toInt())
-                  for (e in ea.indices) cv.drawLine(px[ea[e]], py[ea[e]], px[eb[e]], py[eb[e]], paint)
+                  paint.strokeWidth = dens * 0.8f
+                  for (e in ea.indices) {
+                      val a = ea[e]
+                      val b = eb[e]
+                      val sameRing = ringOf[a] == ringOf[b]
+                      paint.color = alpha(col, ((if (sameRing) 38 else 52) + 70 * energy).toInt())
+                      cv.drawLine(px[a], py[a], px[b], py[b], paint)
+                  }
 
                   paint.style = Paint.Style.FILL
                   for (p in pulses) {
@@ -1640,19 +1983,92 @@ jobs:
                       val b = eb[p.e]
                       val x = px[a] + (px[b] - px[a]) * p.p
                       val y = py[a] + (py[b] - py[a]) * p.p
-                      paint.color = alpha(col, 70)
+                      paint.color = alpha(col, 80)
                       cv.drawCircle(x, y, dens * 5f, paint)
-                      paint.color = alpha(col, 255)
-                      cv.drawCircle(x, y, dens * 2.2f, paint)
+                      paint.color = alpha(core, 255)
+                      cv.drawCircle(x, y, dens * 2f, paint)
                   }
 
                   for (k in 0 until n) {
+                      val f = fracs[ringOf[k]]
                       val g = glow[k]
-                      paint.color = alpha(col, (50 * g).toInt())
-                      cv.drawCircle(px[k], py[k], dens * (7f + 9f * g), paint)
-                      paint.color = alpha(col, (110 + 145 * g).toInt())
-                      cv.drawCircle(px[k], py[k], dens * (3.5f + 3f * g), paint)
+                      val s = scale[k]
+                      paint.color = alpha(col, (45 + 90 * g).toInt())
+                      cv.drawCircle(px[k], py[k], dens * (s * (2.6f + 3.4f * f) + 7f * g), paint)
+                      paint.color = alpha(core, (170 + 85 * g).toInt())
+                      cv.drawCircle(px[k], py[k], dens * (s * (0.9f + 2.1f * f) + 2f * g), paint)
                   }
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Search.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.text.Html
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          /** Búsqueda en internet sin clave: DuckDuckGo y, si falla, Wikipedia. */
+          object Search {
+
+              private const val UA = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+
+              private fun get(url: String): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.requestMethod = "GET"
+                  c.setRequestProperty("User-Agent", UA)
+                  c.setRequestProperty("Accept-Language", "es-ES,es;q=0.9,en;q=0.5")
+                  c.connectTimeout = 10000
+                  c.readTimeout = 15000
+                  return try {
+                      c.inputStream.bufferedReader().use { it.readText() }
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+
+              private fun clean(s: String): String =
+                  Html.fromHtml(s, Html.FROM_HTML_MODE_LEGACY).toString().replace(Regex("\\s+"), " ").trim()
+
+              private fun duck(q: String): List<String> {
+                  val html = get("https://html.duckduckgo.com/html/?kl=wt-wt&q=" + URLEncoder.encode(q, "UTF-8"))
+                  val links = Regex("class=\"result__a\"[^>]*>(.*?)</a>", RegexOption.DOT_MATCHES_ALL).findAll(html).toList()
+                  val snips = Regex("class=\"result__snippet\"[^>]*>(.*?)</a>", RegexOption.DOT_MATCHES_ALL).findAll(html).toList()
+                  val out = ArrayList<String>()
+                  for (i in links.indices) {
+                      if (out.size >= 5) break
+                      val title = clean(links[i].groupValues[1])
+                      val snip = if (i < snips.size) clean(snips[i].groupValues[1]) else ""
+                      if (title.isNotEmpty()) out.add(if (snip.isNotEmpty()) "$title: $snip" else title)
+                  }
+                  return out
+              }
+
+              private fun wiki(q: String): List<String> {
+                  val json = get(
+                      "https://es.wikipedia.org/w/api.php?action=query&list=search&utf8=1&format=json&srlimit=4&srsearch=" +
+                          URLEncoder.encode(q, "UTF-8")
+                  )
+                  val arr = JSONObject(json).getJSONObject("query").getJSONArray("search")
+                  val out = ArrayList<String>()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      out.add(o.optString("title") + ": " + clean(o.optString("snippet")))
+                  }
+                  return out
+              }
+
+              /** Resultados listos para dárselos a la IA como texto. */
+              fun web(q: String): String {
+                  var r: List<String> = try { duck(q) } catch (e: Exception) { emptyList() }
+                  if (r.isEmpty()) r = try { wiki(q) } catch (e: Exception) { emptyList() }
+                  if (r.isEmpty()) return "No se encontraron resultados."
+                  val sb = StringBuilder()
+                  for ((i, s) in r.withIndex()) sb.append(i + 1).append(". ").append(s).append("\n")
+                  return sb.toString().take(2500)
               }
           }
           CERBEOF
@@ -1679,6 +2095,7 @@ jobs:
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.SeekBar
+          import android.widget.Switch
           import android.widget.Spinner
           import android.widget.TextView
 
@@ -1780,6 +2197,14 @@ jobs:
                   baseBox = field("https://api.openai.com/v1", false)
                   baseBox.visibility = View.GONE
                   col.addView(baseBox)
+
+                  val webSw = Switch(this)
+                  webSw.text = "Búsqueda en internet"
+                  webSw.setTextColor(0xFFE8F6FF.toInt())
+                  webSw.isChecked = Cfg.webOn(this)
+                  webSw.setPadding(0, dp(18), 0, dp(4))
+                  webSw.setOnCheckedChangeListener { _, on -> Cfg.prefs(this).edit().putBoolean("web", on).apply() }
+                  col.addView(webSw)
 
                   col.addView(styled("Probar conexión") {
                       saveFields(cur)
@@ -2046,6 +2471,231 @@ jobs:
                   return removed
               }
           }
+          CERBEOF
+          mkdir -p app/src/main/res/drawable-nodpi
+          base64 -d > app/src/main/res/drawable-nodpi/ic_fg.webp <<'CERBEOF'
+          UklGRthAAABXRUJQVlA4IMxAAADw8gCdASqwAbABPj0ejESiIaEjpBaJSHAHiWczexxvSOrRnuzqW+mBDEHzT4gRjv4nZD115Q3S
+          nzb/Mv/qerX+pf6f2D/7H5a37d++r9yPUj+2f7be7n/0v+3/wPd7/gftA+Qr+r/8D1yfVV9CH9u/Ts9mr+0/9f92fbQ///Zy9HvI
+          F04/I3zt/Hfp38P+YP+B/93v0aL+vf/T/yfqV/J/vZ+g/uf7of4j90fnn/seJPym/uvUF/If59/kfzB/yH7gcz1vX+59Aj3F+yf7
+          7/H/3z/tf5b1SP9D+s+q32d/4vuBfzf+u/8D+6e4n/K8Pv8L/0PYB/pP+D/8X+k92b+k/9f+i/2H7o+4n9G/yf/k/1PwHfzX+4f8
+          z/E/vp8dPtT/dP2d/23//41KVVihbKqxQtlVYoWyqsULZVWKFsqrFC2VVihbKqxQtlVYoWyqsULZNxFYx9Pm4QCSv9gyJloE5Eyr
+          ekDSOSZNezrJkSZr1+F6G+wg9Mu0bC1okcro61xaSmmWuzeZJ01JiZSDf+Xetb9BYeU6z1XQgKkD2Iv38B+1Vay8cFQ0MrBIiSW7
+          XbuSJVWMZaWT5Ltx/9k/hEvfyMKDNlzqSQNpyq2p0mb8bRIsEs0fTqD1PWqgJvLJKIXZY2BPN+n4qfXH7GfaF9TGmWA7+v8i92u0
+          LRVAeO/i2av3z6lOB66QrLnyf+Wx8sQmBzhktPLUTfnV9V1GnBqNklKp3QFQqXXs0XVfDz2Aq/ACK/qF1DYH2NVxDZCXI+jV2c6j
+          LDCClgOEcbbOFYbf+iVZtSOhn7CWt9FY07bTIhOmZGcv/qxE71BES7k/P3Rrn26pHQ29FrZrAeUAB6fvIhkdv0NIJuiFo8+q5tna
+          he8kJovk0O83r42UpjWYTVsou5iWuh6n9uVlpuQ7Qxc4CmhavLaZ93vGvzyWcIwk08L2xSat5SU/gYOrWFzRWXU788MMQ4q0XmYm
+          Di84iHUi8MkZJ15EuGNEzh57zuNrZnm/V5fBD7UM3jrgsb3eGB6jQhkg9l/isqdz9XDjFqgwSURYI8U2NQUyUjBBGXEZcdgEZ5NZ
+          HvSKiocmMUYiaOaCSL2IeiybfY45IoclT3Xitwb7000H0uQRn3WWghGtp6XFXbxEAA+qT1dMrJsCf32f3Z7LvnZkUO0cKaruU34j
+          fEJYA6eQpSX4x12KXh2VE7G4ytcBxwQcRM9C2unPLYfybwKm6w/BSv/d8Sc7GNKWzx+iS6oxUPn+o2QM4iss220Xd7l/sSZaUClJ
+          Gx+b15XkgyPVnecDV9cTkHzsPwWZMdgz5Trc5N4shDjv2LCeP1lal/qPTxJhiHvCtZxRWZga8W+Bwfrm0y291iT/OHej012wUGAR
+          9niSAOX5v5AxLc/8gs1U886YLIFjrbBdMJc6YNIino9c6B7TAQrkDuBSt/cANJgABpKppkqxKFiZKeTs7EkjHUKGCNRiaNd7bGLF
+          m6b77REwSDaZouOTx5IWaYFNDtodtVRdebPMtLIEoJ7O3Pmbpk4r65ghg4kxRjq/KclbDBfF/WekH/gAPU7E9etQ8tcT0Jfk+pa5
+          wCUmBcQvRgIIpMoJbO6FYSNlbR4xiEHj7gvFiV+oGIQok07P1JBURL+iZomaSztnW+dfIbYoxrcDM5S8hV0dCTYlOZq1+xWOuSH7
+          Zgubjgt1JNvOwF991QYxjwBLH+OkFPlB7dTlXLYst/SEBq8AVRrFPzJv9ly2zWNc2TQ++sDlnvm/5TPeZ+Ohfsvd4CbkIADdu1ue
+          WbRzMfxeZp9pr45611IUJ7ca4whS9nWpIxZdu49wR/7f4NJg405QifQEdftnOxH0hACcdJd3oykHn9gj9+Jt7W1RBo7GAnDIM3YR
+          an8yF3RMLmauveT0abk74KGyQ7EsvxkZH+KDT7HTN/TYku9VDqccgE9EL3M4PlWYQEGedC9GDSt8pVYqA0BwajLmoO5jQfiiA0Ge
+          PvqtPG/8/JMELkVz5IqLKAZMwKgIgpiDXVwWbtcA1lf6ptvlTg+EkziKboT38R+kvqINLyKWW3YnShJWA/dSIiROSQvUtPTHz5CU
+          mCN/uNG5QFGJkj1lKXlpYJ9uq/9BHDumTZKm3MSBVrpMqaDIHkrwKSpt81kT+gkY+xvne5UrsF9J7+z3qLmlujQvuL6l37PbA/el
+          ae8KMA6FHvv+PiF3/qt0p/DfDNnUqrCfuQUdHwPIVE40r31Nd9OczbCuUwSNnal9eXekW7PaafmSyqHZjWU2zHjj8B7DNDm04tyG
+          +wV7/3ZSvW4SvpmiZ+v7RVd0yfGam9OXGo9Yh+RfaN+AAAJIar5rlaVcRLG3JlQn5fGgXXszpm8tmuQj1rPo1zlpa6i30iyyfLb+
+          R1zvUXP6Y8cn29U8sA+00H2oAJknV55xtyw+kaVe9w62BWrmJjW3WQpRPWcRh7Og0tCNV/OaR3EmVVgHWNdxLz106Rix4wFL7Iba
+          s4EOdSfSrlqVTN9YWsjf2rV0qX9z5tzSv9Te3psVtsdv1JPgcd13/z5CycRfzeqmarFLGJ2Mpb+4dZzQkzYlISZsSkJM2JSEmbEp
+          CTNiUhJmxKQkzYlISZsSkJM2JSEYAAD+/7R0fpXRaz9b+B6y26iAAAAAAAAAAAAADE7oT0cc0MSu2S+BYzZy1xR2AkZyXP3rjQJF
+          uzx41gIscdyXKcPANEeAPM43FGCIl0n6+9QNLTz69WK1AyQKgTgBDZwqU9wbTQNqCmXwyQeDqhpU/XfcisCMfUh3q9LPSksuHR6A
+          34D1l+29DzBh51moFl+wrgm8LofEuEwroIC+3yyCP3MgM+3HHDJEJN4WtqccmuLOpsx75XxOgtCOjxD3DMUo9j94BLBgp5E7aJcp
+          9ijZ20bsQq2oTPTVBjsMDTDoWDYw1eyZGa2aN8D1QJMYyEkJrByQlwEo8PNSEckbMfAkP2ICd08Gg/cRqgCMFFqwuNiibF9iVHfy
+          Wbrrou7EwSNvAtpYjEdk4osYoE9W4Evfz2HrvBXCGArJg0Ut5KXnItDHd9mW9dCKDAZFIsNEvlZW+GAIUds8ejwscyb+fz9iFGff
+          wWNMBWuNUPGc5mq+GNhK9dxHe75UHTiUKckY+SF7Zb4Adn4A0issz5P1JPKuvVHmmCK7olHLQbbZbb/dAXjsK5kUUneSJzREYfqA
+          i5uBfB6FQIeNrYr47n3phvtfGdYGcefUjfJTv8Xj9zqJqcxQXdfpv6Rslt+qrGhgIRxeYpk6c6kdwEQqj+RuXtALSXx25Uj04Qeu
+          PocO0kd5rfiFB871b1FQMl6M6bm/VIGSXpjl+7uMJSYK+LZNB9rzenp5aefNp/ySWoKqyT2AmPJ8b2I+RZ8EKm2t9Dy1+05TxcHC
+          31GpVbBYCAGGuBR/BEbxfIJfqjkCSVhRh0+gf4qaNKiz3SuSUhxOvclGlxo0XENdG1+hoFA1Ber/IveaMCO6UDg3AwMu6GLdrCBy
+          2TtrTh597h8gYPiwyIdecdWQwi/zMuB4dYjCvDLnGM6D+jOJthsuCroSqGKJ5JdkIJla2JHrFHkHg8EiBrt/p0TfcYpmZK5K76N/
+          xPRGY7itWGOdMV6LhKKQXERZnbLZz1yio0FYvf4O5FCRHl7egW3gBVRkjLwr1Vfm5xzrGD8cIrC16fToiZV/nkQKOqyoKZEesKUm
+          EpLvC23zsj6uxVrW/Glv60ec1foT3N1pCSfQFv1Ydr+sJsYtbjUDLyBwmwnovONdKPtonikQIPJnYACDZ99Wawgbiojq35LZBgaE
+          OV9pq4N/QRMNtw+pnERJDIvELfIijeJ0Kt67eWLmdpS1nqdxlZhFvHkW7EAnCdfmA+Jdc/xC9h/X2GHViK+5qyrZnDYi5Zjxudn0
+          T5G6GY7dBNms1xP3bER19M8GlG3LbLbFOaXFILGlK7vZl+igW2234DmnCwFL1ZoYBVXwvoTN40rq8bdYmGwr18OFAgoATguOsDfs
+          /kowZyWPpx141pFnjEJ+ztgqQUhNnz/QNgXIwsN9Uas9vXK5QSKeTQr+Nt05IabGuf12PlYH2drI5K+Qz2uN+e0K9oZJiIxRFZWj
+          NcRje0hS64ViCLT7+TVv+ik181ds7JBgeM4PDgr8EKhgfxR75X6ul+ASJoAcTapNcGtDfkmILPRrWPjfp1TR77MEbBynIZpMFXPx
+          8dmRtD9mj8w+VXiElpcwp33JZR9xFkLT+htjkL6DBvVYev8m1XwnxWpY15hLBEzVtMCkR8Tm5R2Qq/+z9+Wh/T5M/PcrcmW2BsI2
+          FJC1bSYFneZYE5lOuZ8iF7t9WM6BEBoAqWH9TL32vf/3vp+KhFl+hUn+e8lb5W6ZUZ2iYuhZE/5G7xgeGI+2fIHJEyHqm62LnfNG
+          Btu9scn3RAcz3V+ZRsxpJLUpLMnds+mB/OXl2cSarDDxZWUt7iVdjxWppz89WjXRU2gxP93DiD0UPlxR3YPyUpGXhgKHX+OGZvmt
+          JJvLPau321YJQ1VLhlkWlx0+XpxNuEgHy4bu2aA7ek1Ge0BZAIs3+F89agz+nzUeBHEIxNlhZiwCu58TtYtgQW3Yv/esB4IkbIMa
+          TnGnNNUN+wfJEmHouzHjX7GJKIVLQJRYxDr5lBJ0+9yPllevJDEawiS6VK+GRpB330Lvuq6w5x8KLI0PDAtSwP5VhYIZm9wWkGgK
+          WnydXEPxpOUxe8mHsSzDyDQa9VzS5jY+jU1WyGQl8sHFKqYp7htgUfI5RdVuQO+M/Kd/ucZY13jm2F9Lub0+oMOjZ7yJjZwfOFOs
+          YlI9d4QBgAU76mVK1BQnw1IO003aqIbz9LoO4n/z7Zl3P0Nw+t6y9Y84NwaY1fJHlDelloKd1lDK3gFBXs0kQd+AT1cRHeyFnmCU
+          Ks7/xggwYgxIBy6pgnBvA5lCCip/P/LQbs4/3BYBykrH+J7YsF34dOyDDXVXTYlmU3t3x9PYFjhiS3wJgOJwI+YuggXqjweLZRxa
+          QxvPn7grTnEBk9ZX/gfpgy7tLknUBOD7AgXXlB69el19yih62uXo+VQ7cZRB6WcRFuLkyql/xplYmcGvww7I/f7ZzNduH3JbZCF1
+          tVYdYIlgHpkeHHggxs1fBpGFwjvMyU9FKiyR8SI9ycoNwM/obZ2+9yCmIsG7Xo5zMOyNr6aPE6JxYKD1+NwpQPfNAPkgVbPZbPHI
+          9OP2g1VO3VLbrj0Rx+bAxSaXB8VaaBV8nVzUHcM1yoRSRrzJsX9mwv9TTJVqiVyvCAMRX6vka08LIuZaAT8bBg6qTrd4eZ+gTUNb
+          gfOoguZvi9ML33ygmcXYi2ScemseKTsBFT4z9vylo2RZ2SgoNlPaNy2AW5nboMF8wK5vvD4MoC7LWiT9/vVx5bZdSczwcRV67DLX
+          7CwcYc2l8ON+fzDjwfA+SGjx7QR9QfUdcoa3StvUdro94gouj5RMQuRN5vJS/CtOHl2GFOMdXw+1cwSQIbqn73XcvSfhnRW/YK3f
+          ucBBpC/1n018xEV3WCwWx9vslqZWpEuKdXF0CbtkAbVNuvUiBtGe5hl2X8EQ1JdgI4zeNJU4/MLY8dLl/7whOwn1DSBybf8m3hK0
+          V7/wR+129rnbiPN3F9Gniz0HOFa1HwndIIn4P0RInCWQwmi8UtCvynONafGEmuMKrnXjOmisVb3/v+Yo4VL102B9V1wJOQoQmQmW
+          V9kdGJsabXpvQ5CY6R8IWYvYSpyfvhF/pqWc2be66aClMRKZVN7y3SSEFMgROVr18Eu9KpZ4bebkrYJxNjYoIgefnVz9K3FSSlxs
+          VMq39ob1FP/m05PM/Jevxx3X5EjNsJRcTaOMqYXyEJJSnJvOMnPEF64+Zbe8srhJxIpelzrQztiXYUjorLHcgRp1wtuUF09Z7pqE
+          /NSmsezaiYxCaxfg2p4ayWZIRsKKD5SE+phh21BE6aoTTpLRVtYeNE2aK1/B2EKi+iSQj2tvJFbNlywOItuaGMOxXF6hIo2p9+X8
+          kgXvGRmJQVq25OfAxQOxOPd0npl8vHbgEWKG6BzEGPi9cYC1GrFBeg5CwNldkEfFZ0Vj0SHhjNt+6Sz/ZyxLKfn6VVy1FU6JFXf5
+          1EGPTSAzZNQgzvacDyeywb6POIssWOtc3idTjdbbMz3zD0pM3+Po28V3ObRagwp3XMhQ8vUiQIeiGsv/1URDjk1QXUSkoHd/AotG
+          guSJsU/CmtZqZ6lvM29zqcyOGBMFjN6OHkNGiME02h9/yC8TOmFohyJlNuU+kMYj948P+PkJAMWlGuENCn2banjxFJ1k+WLrm84Q
+          5P+0F2lPZ5A0qPrumc7nxR1NQjotkUZws9CBVqnxLEuzQMY0/xYvuU3TdcwcQMs1noZSxsbINSiIoFVyL/+lzquijVe58JoAFXB6
+          NRuqM795kF5zCx6peXocAM4B83wre6CJJcZfbFT2s/dda7BdmhDwGKtANEiAo+acg8TUTIzEyVCST2+MXM/KV8vzZJPumUTs6DuW
+          3o/Vx1DwWgw3mQCt9gywRRscXgIbXO4z6f0F5XAWBtPE/z0QDVqLOjPco2v8v9CalK5gXbNqdyy2Bx0T5l/JKvlRyUU0mJzO2S2m
+          9Uf3NUAq5ADSkzh9yhRKFmkbxif9cbHPgDOnlkTaNtIo848LgESgSHe2xeyveJRN7yiwfCrHvjaHVQBeQ+A1Ief82lNS1aX46wLf
+          laktWiua1aehwTfhkLps9ljpuyjRtULVWd2ODAGd1G7x23UIXXR74kNEVjhhur5r4G7YRZPXYq5t5Fo+4eBIhUzjphqpPhvXd15k
+          K9uEUexU2s3OW4Nm5U8vCYMAYwrvPxFBmHJpyaqS7mhDwCwGDz5SObLUjuU0vP/8WvjlncNp6OJyHwakujAySK2FzNW1AE5i+Fv9
+          W6hjhVViSRdvNebsEdcCZbli65hop4R0tq7uPGlYr7VW3DjWCvwDPgmq1/+k8KIUe6wNWVfwekfVB9xqN5ojNn/wBDRmbtAhIGJ/
+          zN8o6tGVUxHgdtkM9T/812yVFnszh1KqJW/zwpDnWnFLhejIaaKaj/6jz1yuh7CdjXcynnIeOaVptVl6Ojl/vYPOaaGoGlXK2D10
+          GQP+mYMSP2WgqzD3CUr/7fV0Q8X4dZXmA+QmYAvybOHGyLBQcS23YKcnrcVVcxIz1uoVTnoSnnr07dIsSUW7MEzP6f01t6zrtbAy
+          MQA/dgMcURTxVWXKShWKCUL5uCZ7L6anly+HOgrABafK1puogVdcnN+3ibP6n7HoCyFhPdwUI6c/H85+7u7QDFy4nD/HKt93W7+B
+          OamseZzhvGHehzYTbCcx8ZaI+ndDVECS22Xc/P60yFDuIe69AchOA1L4InVrudrgkPSQ38fK6/XOM0mLDXWTBBUV8262UIWgKFd6
+          HLqFEeHqRBQgl82HAFfYfe72JIC4gYGXeI/KSE/xX5ieJ+eSJ3aM5VtZpCuqZvFp5vvO4pOTHnG/2Zw398rNUKM9B1pCOGugK05s
+          OWZwZ8g1ChgVDHajwb9pY1sbedXVqwtpjwuZQ0cCZUCDMJCd6lHpEWtXmT+/VqknGAgYPIVMYcQmDSf1hasSGRNZ2O9g4fTVNsPi
+          97GGY1t7Ql5SlmCa2uv5l8lTIO+9wVD5s/yHd0dArt0jKsKVo+8vPdFWErUIr18TSb8eBWGJB/Q5hynNf1Q7WzzIxLctpKV3e+u7
+          wrPnaJTDcIcSjPiqBnJKLyDKobyQMgZP4IIrZ51aN09eDlGApZtzbISOEIANoBpI/gmqYnEQUbOsPdPGAeuNrd+1movw9uqPIIBz
+          yUT9OGnLX+OBDtfLOxXBpFRpgEW0tUUly2Ret3xBzgBumjCX36D2+V+W61P65LxtjuNRgu+VGBz9U8E08f5afUdu73m0EvCcYYpX
+          IsOAe1yYa3GrgapE8+nOezScBF4p9nUOduvPaEy4HgSnKz3rpxZgD55zRR3AKNBxlRTX4IEcwXmcB399kFMy6mOkDjswtyDvmIkb
+          NChnX5rwzfWBSPuq/6fr0wFUIOKMBKISUyYKGKC7Jx6CNiukZmo8P09/tt1q5GpKw9WweTB11GHzfV/ejwvsUqBAP2tFIp9LjD82
+          //AQAkbQMbbU6UOpKUPKQvvI9XUz5GU9dBRhlf08pTmLGcDcQfaJK3KJoWXIvTnxq47xM4zOBkRvlB4IbjKfy5gR1xjk3ZULN9uR
+          HVHB9wjmCb2LyOV6qK0Cf8XAG7911IE2GBF3fI8Qzy/PGSNirTVcOJcVrvYaCKXT4EbtjTaVHOiyuP0n0gEMoDJi8EU5SvMi1naX
+          5+uH+6gzvaQj/m654N8CVdwJXW8XdPdXBMx+VN7JwAsU1Jkj9rltiwRwwldunZDlUdK0p1ijSdgRMnD1/EJT6CC6OjfpiJgSKit4
+          89xwDd+ucICEC7Ykod+LW3E5C6IZtKNc7rjsZQCDsPH8rlWx3nhvV2TQp6fYxmBLWbsxg4OR7NqP8TgGJSHhJ3QwCtq28VjGNw/C
+          gwC+XRYh3PMCnqxWaD8VxB/qKbwSnXpZ3Dt1fJEHNKT47wK5Lzzs38xMbldujdiwaNOF6GHmZ9HVW0fMKwvD69P+fMwjdMGFM1nh
+          WVnJW4TLrLouYaHyxre6hZdhwcCN9LrPu+WLJ/QbNezqedlGZY1NxeBPyQ//arjB5If1ibsmBevx1JLaV8KI/s8QVX0rtRr6dX0V
+          Q1OwCDkCE6agIv1tKyDujXdd4NV06G3k7wRRWd7jscOIFY3uRUN1Ctl2O+19FbwRDHs/SBEbW10Y8BpJkZLhqpfm2+u7A5tosTYw
+          V0tqWpMeYRZLUtSk73qNfWpYKT1DNYo667bUzp5+i79rTTU6aBDzJd4F6lj1iitLKgx26ilxWjmqM9m2kc12pUeaHOSY0E1bvWjK
+          uMuCbL3vQ1IXyvPpuLugGUikvj1/Vc1iNc7g6m41DFrFftCDPBRCbFZjlCR5r8ThrnAB+35vqQb4QzFlmCLwhfeSg3ZNx3TRnoG3
+          Xb3N8Ub93yfWMlrCWwjy1sNhi5mMdS0ixGuIeeTcIKRZrOqbhv/O0JyEXlPE3o+4OPHL7K2Q47JJuyNMb7dmh4RhRG5KRnPSHmsH
+          jbc81kT9SczowGAyV/cdThuuB0DPWZrMmG5fMjv9aHF1VZYdB0aXoZzIhJDKv+vQKZFab7d7nm5TmNAZw60VGCZ73GopwzOD2MLZ
+          iFQpeWxb45LGVrQeITZh1S4h0F4KU9TJhRlYjfYife7NXedDl8WQrDl52w0bO2yaL1QUEcYAL4gfgZH2WMdgSvBI78rzfhFUXegx
+          9G8OYQBRUthflA8L6rYGJlcEU7DFwckc0sJzb4gmBqICUAKN/i5bx8ounIhx1fsrOL2AKjMw7i5n3G9ISBlIoKfUSMqHlNDPfDHi
+          ijMIKmmyWPF3Zw/vwnMafHcxwWrruyVIVGMGQ8b31sisZisbQbQZ7xiS3JyB/ZrOQ6cdF7D2wNGRaEUs9wq6Iut9RL/FtThhRNLo
+          ZAEzJorY9xWPySTMKyeWJhIvqZfcmsifiTSnibJ6KswfpsJLLSGpOXWkPackHhfIMV0PrKyPA8GEagSG6SRoSlctVP+1bgS/wsP6
+          IrWgKcyjxM5M/ORkfHGeuf4qfQ2ttz1THqWz3mY1et280R5ITllbtUdUSnsahyaK7toZlixT0rCGT+oJmW506faMDhYqeIi3/UD1
+          jYHjer0aBk6TA7Uq5WpVBEB67wpu2RAvQYnJtHfEINMDw9CGcoKk50lI5PMs1QO5uZgezF/5EUKsAk9GetoP2wnVqjghMOf8w3F+
+          8FoIAIALcYSns5EGyVA1FUh6GYQDHbu9Jq0GLE6rPZPHWKTwH4dwdxWVu+UAXmZjC7nmn3Sy976gYFQs2brMdcGxpzvxc995lXVi
+          CuzMcOnaZAfrUienmnHR34jtgTLyEBunzp6+0QuflSc9oW/W5z2bsKdEJH7gaKHVXg8HFXm371OTItVLIxCdqBxy2jCpBlnbU9Mb
+          HUh48LC2f/TdEgj2Srul+JYnU3PuupEgIa3nc9vykGlPLo6GOgqcUrGJyrwvx5YD1dCv3grUyy+eXQSXesytEMz85hB9ZiQyMsTU
+          6+aO5fwrHkfWNVX0DXMlWptL83dtwidjc2my8OZW7VYUMJUPT4i+Ot3maa3p3sHjBcc4dj8D603S45JyJoT9x7Q56T2F7GFSGqFI
+          coGmCkx9DCyoLHCiKbReky4fgf1MSTqmw2olYCQ/MQDh1ZKi7wVSjlk31FwL2vhcFkA3zIrgUKnan58mhVybmz54fD8er5P0EFz1
+          uKS4hTZEeRZJik/IhlM5/jnzdhuyEL3mdSA58K1eg1NzvblFNATz5ugs3hgdUh2hviOFC/MuMk6+5gnyWppkULCLsSdNvGEKqEcq
+          d/aVpwUj7MqGtAHgtYIu8QUV6WB6xTxkMaMS6Ju9q3NR4rSzT1FFghW/ANG3xSUAMbo1A2rudCoC19ei+MFU86dKEaIBi9LNJJpj
+          QvPNs/FEJr/xh3gRoTXYHrpMNS7np9kzS94AKyoG4+nB+iY3vyXEgDP184l5oV4LUf4INPVk/kKA5UCxNc+IrSExlQyUcUtkrAX7
+          eLys0qJ56J7WMraFVKkeC+YqZec5M8qPdt4Mr2JE/LdhYq2BGc5zgCsQdRJSa1Z9tz579PDY6y9NQlilYvxZmoiXMbnOdX0mSTj1
+          jhyPFhMNNrpXvo3k/9rnNUNIUhgyo541x7YeS66AvHMfMPkPrpnJivFhNVhRDApPY00cSkkL/4kKfGnwwoXlydvK7BHZYPviea+c
+          kdSe86v3fUKuNAlNbdU1epQQjpdXGaS/d3mJOAwzAGU7eC04RnwRsQK/lJgZwPhBX+xAmv0oQ5b6whBezQay3zeB4jGJxAmIhxRR
+          mQv76SOySx8141nEojaPAIxqIvCYPstT0ihe9+wa8m/6aoo9zUTYnKQyChuobMVVGSKI5G2XtRgKRr5CZzQbbXKi+3CU+k3f1CpF
+          lYnq/pFCJBpoiiT1NKe1jD+Lj6Bez7IgRp7cxz1LmfzfGmgqAUF36K9sYXal5MKAcnTIrP4YvNXoDqm3p95C9MsLrM/2201FUkKG
+          RAS6K/ZzH44o5tIzjkxE26vrluq0sv6SeVhswOvkvvohlel9WFVFh45yAjofXYHBkVDoLVZNCE0nonT7/gGVLssTBp1WCJfvTUCP
+          EuxbcSZ6gIAGd8mFYWI1zD1tSV27HCGn3sg18tFtvHvdoTf+5GfiBTUany3PcaIkiQff9qQF3Eh745GWIZP1XyTsFKB3n95S/xDS
+          mvverWdb20DQ1BU5izQdsNEuVoujKVh1feSxK/5wUk1FMr2MHDgFng/udeGffoxJayz+GHAEtt8nTP9LYNdZF4K67AggLfd65bxn
+          F/v0ONdNzA7AcgO/hwmOFHhnOoxKV+JtYYlqNAngWHBK5yqQ/mBf488kWtFcuYzUaIj/cV/S03tKgPyScc0TT1xyL+qkblqxEg1T
+          KAyRKIovWE6+HRt6ZMXWciBeg3I2zfA4RZgkaYHrsEcwmdG8jsKmQm6ge5Wa8yL+h4f2CYBUkMrI04BUc19mvbSwxL3RS40Y1A4w
+          62PgJz4YQglmcb++zJjzpA5ZkzxWd8k81bMo3coufmxZ9A3Dt9fbAc7bPxHQ5JDuoa+jZOpj9T+RCvgSsYIvmwZ1Bi5+5+OVIK77
+          VLEYLYWSCP7PtFywP8As2vV026Md1vBqZfBZ0XezO+yssXvLfl8xYARBLNUZECjnJF+PRN+A2Vv7YNdaCbYyAaRD8y72oze8MTAJ
+          7WPm28U1sY1liKdRqAzUJr2PGpw2a8kZ+SMYvkHS/YknTUXhPl/nAwy4I4V55lSETlIP/GXIPHU8x+FMttceVAuDOSprfoOwO0Hw
+          d6biqBrC1KeA8BqM/1ThzddxasEMFo5VWqQXIyQJknoTLrtSO7lJDxhGhRz5JPBeu5ZCbnqGdNRARKpPdiiVC7WpFtkODu0QRcst
+          iOgdRxZw+2q9RvU/37H9aClQiRl7hvA/qKAp4BY4JxGpTXqOWYjiFOJbqHsrNPnL0c9NhTGQUjV73yB8L/Tf+OWaHrZVii1N2eMq
+          qVe2WnEnIi06v81wTh3lI9pFpGu4V/+k6y+jHGmuSXtBOxv1pTfCCAPZzP5H9G+hxeB80hPmkATwTGnQ4LY07erRsZ8I6ZHiKrHA
+          H3oEY0rUt8aFxFYIEuk9lh5PcE9GbWEGprCtjan62kZjrvGv3gZFdhK0xDkcSltHBvqNVDj6hKS9lMYt5O/LMFMo4VsrfbqpvENb
+          H425x09FKSrqxidKVqlrM3I94+GJ2arRr6T5hgPg9PpKhUuYaukYn6kBm2DEl17U8Whf/+6IMLc0iw6X4ZBUUl7TbpIwsVXlBdxx
+          mIjOj5PUKzhtwSfzJPUtotJu7iWePn/zDb4yi0erMFMfeGbAlqVgWiTNUmz+GryL/fuAn9q6gGZYdEbaDgyb5ZUvzxcNkBYLUbO0
+          gdb3Nlvv1+w7y221XcRJH+P6p0OqXzsnE0pd7IMUzTA24mv44yTotjyY8NdQnvkRN9ttc3SVgVSrE4sFYPhmNAaDkOpA3+fHWUae
+          uyg2UsVz/Y4+V6RhyyQmeQSguRdqWLG1BTVxeZQbdMx14C2lHt5Bj+3c7X26hXz2GJKCb8LUu0oZBF8NaWV7tsBI/qSeIhTOXBml
+          9XdNIqpLAiBbyqWn7VsbhiHnv5kUzuzwbTfYWKO+7ouHWIv78RxamJAeHCr1KeEKyN0JR2uBYbzFKw7+LrziflfaZRVi1TuBwsii
+          E8zmb/oiEjscxHlkh6R/kiuIQQgt/zjZA/43SoW5d/SWmnqlh0Z2uIRmbnZcklZkspoT8pwjHU2WRjTvZEPfkrXtjNgYviNQT8MI
+          nJPZGMJA9IsYAYatCrSzNFsXagGUyI9K78QajfSL0His1zn6O1vhjlV5aWsiyDdi/6yJyGmKDnBd92zBtSHMPx4VKrgcVWhY75fV
+          UZgsOFSxF97aYyDc1E1kC89JinhwsPvSFYCacsUAx0ozG2ymIBaoaIW/7rzVhFx+2DFVrDj6j9SsnZE020UTRVgv254i9fLL2ccN
+          yYxi10CugKnoWNRT3gu48J6WE8d/Efl5rX8ME5ORNmNqrtwnYgQxv4qM+bTTBadxUjbJTm22G2wVGXOU4jjPKhUBqJ4Nr1Xwij0U
+          1SiEFsf+1detQ9e3ioJK0P8M+jGC0WAjB7ygespcOGpAJ9qsU1WM2znUfKh3aidCNz2W9HiY1MTPLmnoavlFWxH77DgDKzd9ivKj
+          so1jaJEmsXbGQEQNJv7kxeqCI86xo+i5gshnSuuu2d8Bta6fOsY/oubNLBlyuG7qu0VQ/ehuwnE4L8cDtOiksPgJwOKpqsxlYA/o
+          1LgVxJoqhaMqBeVHPbehv71ExQbM6ZeYvhjrWXq8P1haqxNPseCqYSudiKMeN9ZE0NHgZVztHcBLDaGabiknYa3hjQ8zu8EKS9Ht
+          E3t4q7MvtokEHrSDOxuj/G+0SUBMghwVGDml24dwyKu24nIodwsg6iopKFbbFk1i8a5GPeGUOV3ywgkJMtcTPXJS4iDTj8e5/Zuf
+          DsRgQ0BKPIx9r+m7o86mQDWejYEGsvU2fpRZtn070VsYYgtODQyAyzaOT86swsfTXGwMvxDAWb9JsJfWziK9Ls1LJt9zABuixbk9
+          zmL4OUSyMT9iGy71XL5OO1t/93JUtkWl2lyMqxWeGADxBbhhreNR444opqObTbElYhKVBEh5ge4bbY/+4PytZGs/V0cOaPEB2Rmc
+          OsNO65Een17nRNl9iLH0c2FlT9odI9YWwecKkIja2ISwRA15ieJpHmhhfx/VwmX+lsoTPNZ/P+3uaRtgqcTuDqDcVO85/meP1nfT
+          XumYEBPEJXcYIRzSYkQeLz1JZSnDbGDZvo0fMPqDvpn1v430/TqJCDyoA/N5x6D0ze0J3ioh4Z9G8oLCpsQ4dPwtRst0nTHnTKAc
+          2cVl/7GA+IaXA4svw7PmTzU4x3D4bJ2WIbMyuyKC3/gO+Zgnl64SK34j1/tlEpJ+3VwCqEnqjr3UThToUNGZDwmDHm+V/zWvtxTY
+          FJyj2O6OGmae8FtyC8TyA/DRPmMghL7bRs5MjRF946NGsCmcc3N3kMQwkOuezTOJh45OcP0tD0mS5fuYQ3zvhU+bQsftlY1h1/mN
+          wChF9HHxktxEt1J6LAym+/NtWjWwnUis7ZgEQ40cLFKTSxx6j0lUrnUSH/wc/s6Jw93cPrTYo7UDJrMNS0AlimYHp7H401PE4x8X
+          kjh0m0yDf7RnEJiAM68g0HePaJ8tvkMYO4QO6eR1UE5bgNxECh9HGN4DSrgTapwGt8NQDRWmE5CpjyKaZ33TYEQIWXbdcbz5Vowr
+          qCPNvmvnYQPc3rCSdoo+xf5Uzu3pJYm6WfTe8i3G8UgQGz9X+CW6RR9NvFq+x2g1ak6vu3jnLHexPSvhCY9KC0lZ2PDRkL4h5wWS
+          2l1Hd/oWH9bwHhGOAVO3k7IsQ0pk7YZ95uGpFOPzn8Tt15KdYN7dRGkhtTNUoPf5vH3hBt3qmM4Rhcfz4CerZkZvay9UVFxmpNGv
+          Wdek6otWkqXpKuaKfxfqmgkUpJEpz7y2KAnVmdJCuTemdBYnSa5mdOFP0sFyHVz4DOfR31Ulc/8kOszStBQN4cJpHIxEFpyBryCj
+          WRXpDOLE0vUv+HZ6YqnjS2+j7Z5kxzOS4bNve/UvG1bxkpyFmKdPmL+WyloKZccpOISityppc7+lLqXP0XJ+L/k+vUy7Q7CnZAXf
+          +oKAXkdQ8xZEbVv+PSfPCJIT79d9YceujY+x6Pqp/II5903txcpHCqCYDibxZ+nIeeL7a6hIum/MKuIcos1CNupPoT+PLHosPex6
+          kA9/Jcnx0DVVHBXIj3qaZK564WyZHXeYCgW9pHpkIW6Ob9SRB7HyxNOa/GiwWwseDo2ox58hkhelzoYR7/B6BmVYAmx97pGAxR/v
+          5pQX0S70GUdZh9kyeqdYl4sxLWohIft7eOsnZ3icGGdT6Hu6xrfyBMtjWtBEzudgOMFV3nZdeCLVVYu0JXKlzkApefR7OTq76Kr5
+          71XqkZqA4qHKqIQnVbJ+GFiR2LHgsTR7GcVOkjbdIrX1hmBCoGIGk7DdhSLuWgEn8I35yx7wqDJoGY61miVxDD21fma8EyRA65Z2
+          ht6SVHQ5z8maGSC61oTuH6NX/YZ1xpdfHkP4+sdBJKXmjw0ANQ1SLzMu8ZTGju9bDVI9oo15Ace5s827czUSW9nkwPyu2NeyBzWm
+          9ZJ7OlpgOBn0noBFT9wxupHclyQ0VVNbZZezGBgQd1PmmGYRN+7CKPYJvlQ8XF74ravU9QO7Ek/yIDVDnDqG/hHZ6pZ485lRT4NC
+          ALQFTZ0+ekbA/iDEqiSHUGuMPOU/s73cdM+lWTDjSIExjIaRYD/LGDoePGRlJTt4xTbTtZRCVuiCbyA2z1glJUb+wQx7WX4nB4tv
+          X61HvmkpZ7FaqZNm7yxwaZvZZ5M6lSm3el932Ev/DfmcE4fQLq05rAR5fi7+BXFJdQ06BUGO4r9FGn9gIYaBKu8Tlxx6kACDVFl3
+          sLo70bHQvktjkGeRgjGjWXSw87kz2TpdSsfE0/p3iz3wQP0GMOm6uu9fStBxfD4SlAbZ5QdQzah9pmdjWoRvoukCbQsyOkfpyG7P
+          CpGNR3SMI5zkOQ0+WoBRdQ9Lo0PzAXmk7Jfq5qmPqRrpFCkpfhup0bKra8qcNXWc+iK2cKKDFEcEkkd7V2WC3be5Cs9Tt5AYNd+1
+          A3sXomBzghiqNOUsNOnN5w+CoaVSAHnsTJjBZ/9nbJt4lxNARKO3X6tpPAGYhfVQuvLELlkQAX0LEfo3iUblDE9WDWbey88RCx/Q
+          ZKbyrbOBMX9eGGlFPHKePStGpSVY3JW+/b47U4FrpsX9vDqQZK2RLYx+R5ZIMsUbSLj16ul9Z6VhEdWEmZavciRLO7b3xXvG0VYN
+          xFYfOb6JJldTxhMtCriT4uW6umLBtaQ05HnP2LUFvLOEvWFqKNrGFXxNKW8wc6rvYS8yh7rIlfFStIgrDx5j37Z53UgdTlfQ6G8L
+          lLRKJ1vIzcjUWWMux6kczmrrc5F390+8MoRPFgmqegQRa7NrFRxVP8429yPqkkYVbMUfECBk534ZpozAYIfIOdlgiq2+NNNWraDD
+          UaMMbKHfRsnAuvmYuq3vdnZyZU5vfIG6YXAR+A8qfx4UEbeJrqXDJ75T0CHy2/3XtAaLDNkIjLHpYEnjG2wwcKGB+5jO0JpwHXBh
+          4aa7e1LBeGscy+0TZnIanOlUHz4mPc+gZFDe2+siyT9VFaJ1OhHNvScIGBvyTNmESvS04BULHXng8w5oFB9PQclUAHcAPXDKsa65
+          shV7WhVNcyffjhcrje0BLGXpqGTFR4JokYbiqFpXhD39CGy7t5qDjXVZY/QIWnuOjCv71S9I/4TgHAdKP7DfpKdZlmO8okvajXut
+          L9GfWTTIdqraLVFFDD+9oP4glZQapuNISaFGkNk8EMvIUprRglC6yJEdCjt/TniFUNHKKkFhXxPwpav3csIBlo+YMO0I0QKnts/w
+          6jXSBYFGEDoQG8URryQmVQG/XHUqFhkmpqWg7KYRLDzYY4dLa16QXVDLBwmrhDff8cOnBPATDBp0bFp7NMPe7WxazYwZF7bInB7T
+          dHwnvrI9vC/wo7oG2v9rPMXNcC1QqKfxzkDfjyUiHeGerPCG6SEr0kwF0A+8QZNUn1UXqWaed2ECtBnbTjxsVe/qjqYAWZP+W0AV
+          W0tPdgO2F7fcgLBMed983XcpFHno+E1x+nWdnKp8rXwPIVpA7chUKaVcklMpoZ8fmL3C/AbVCONs8p/+BGJfwaSZldl6lYpTRWO5
+          2psyiPjIqILpYFLg5PX7u+CHxWS/aMh51anW5qp6cqpGfsG+CEDiR3Hw/mpZ78QYF2Lc36PrHjOU4TOMDW8+qfmIFt8XXPaJn0mY
+          qIVYpYQM3LSx+BMywrNnz5h9KOvBB+bv5DAXHCoSsi18dY+SQq8V9y+UmmmkI1DhqA2LRVxEX76NPJb5l2ro7KLHBcc2cppHqwnv
+          rCodAs0NtxotD9o7fS6psgkapl5J5D9UDyXytUsy0vKbRQ3yxTVfBLtwqFCkVSrwq/D/9UJGjHE3dG2xOoXEM+y0u80OIxe5lh/o
+          cnmqLZcgnr8fuKfFStezJwA72VVdjUJomGd9SLeAOVBKfkRkddLWI3Gz34luyRUfbX7S/ah1pTnoc5C3x0zZSfvIur3HlACa99iV
+          FLeeRws2lF964/P8IpzuKQ/8YQJFN+53x9dJQns18JVf5i5LAoXwj5NwsrvIzwItKGidk4A8aWO/qdJvXOGzvz806+lkL56iAZOk
+          F7HQzT1LSICAin/qGGQXUGMwHf/iSOvZ+93OpXaU/4ut1abpWPaPdm7ZLrU/+K9M4Rq8uL7+t3FlYnPC9FjyZolJArf5K0CU6r7u
+          A48Z3sH/6HSZYNNCubHZ/Gqqpr67AFE6evhfuGJ4Mska6Zm1tEYBfu8stow5yo67v3XoIKgW7PCthfQ142mnvnteYbWEwog/5I4o
+          /tz/aN3LxM5R8YcVH78CkSyo44NQXAK/aHaM2MxgzOcIF8DcHjY8WjhLl6MoPSu5zUV68gs7tQ9kUb371ZdeTQ6JZ4XtMjl5Ouo/
+          A3a8rSidl4AC7J94MaDcB1GxJW0ovcRAPh9lOBO0Bc99b3EpBxi0PaOQnZ1n/48ap21MVOJeFDoazKBbfie7eQlmE50CGDL3w3ar
+          Kh+4TMOFvQ1Vi49SR8W+Yx2sUrkz0bDPlON692Rj1C8ZtZA1xJawZEDjx/DmuIlkG4cd5TbrHgGzd3xDJOOW/yKiO8h60v30Od83
+          kEtlcV2iKYybMRhiw3Rj8V2dxDtXekXUZWzc4Vvt3tfBEP3mvevr3pEhP5dcm9J3KhCktAA4LdTfaQiIR1wlM2ZhhmKTFzlK47g5
+          lA/vuYfl3yS1PKZRF//4bR5strnq7oSmSD/vxExKPof1IukIADPqFyCrQw9zoZh7l9zYfj4g0RVfodXeyNy3Ig1u03Uy/oWRMsIA
+          vBldmvbOKBnkKC3yn/fN/IiryxK8erJsWUT6l+Dm2Cjq/GcZ0gh/3K8I17MQcvahR8QFTBMrouHd3EOIgO5ejYxeCpGpAlfQQxXB
+          zOsmQMTJQ+znYwTtx/Ckmmaq3vsdrlpOa06aaWfrfwfH2yxnsdJbCpE4s7S/l+SjEWEcJ+r4EwP42uvCcKqnO9sVSYNsoIVjfHSE
+          ph6t4xKIJoXGGyFyzt8vWggzXVH/gzOhI9+6qGaZta9xty/WBZAthhMQMg8TKR0/nouXfgkHuNcwo9rAN2GjnW3qEt4ScpW3Op0N
+          CnrunCJKeRCsIgJHVn1lk0jPCugJqn8brVCgwd6w+9Qj/h8PW4J+Y4f1GhmV51m8MWYnFsLo1Ca3heYHuYid8FClBfjF/Er69sGU
+          +AAWOeHQ/LYU/rpwEhFglzCvf0p7vJcf8hv1JU+sDYA/xo2F68KqkZAXIjiIlec4elVmaRJGyqgBFB1V6RbFblwJeRUhRnMJvLF4
+          E3jMRE6ku0qyNzFCRHS9Dj4SQWTR5d1tY9OPny7Mj9582sujqDNzo5XfSU9FTjPcAI2UETvfalRSlpH2am9PNdHG5OhpyoNzFT24
+          0ABRGRhw4t2cvl0knDZCFPW83s3J/HYLMybLtD16/DeugX8RocXAqMEc5BqSejznMvXn9QQV5aWmi3jVP7J2Z1OZuEqTi/AyFLZQ
+          m/1QpbI4a/Kg1Bl1Rx2km2OqqChzyz3e1yTGsbnsrER+gB1NwBYBkTzwDBlFb/24CCyOYa/9MzCblhOHmiME99BGFYYzTretgvdJ
+          nCj8cx8f1r6NOtg/7mbLGE1QH74VScBwknm+lXn1jDrlDXFS+ngFA0DW9dWosURjrbuKFG7f3mrgJBpROrLXDPSftr64m/EvD20a
+          4Y2Zis0UmfOyZ/QR3wkX8xXuc9wfABdlKJjXg3SBTBNSog5LsbAegeYCxpg9fg6pC8pgWn/QLhcIRY65VIa46tHIYwQTaNwFhq6J
+          fcgnB82mCmBuyXbW2ELQymvG95aGVEv5RNPpMKs0Zp0BnQrTmuokWt/4V1j3Cwpn0PQwiDJXtx7Cq/gUkYauQHD491wjOrwD/qpI
+          nXGrvH3xHgdZvIy84QQvoQbIcrawztN1deSdXOrGwJ/LRUG+LeXs35rykIN3gchD1VeRbsczgnFGKjrmuIc39tJgjeIfq5szbTtD
+          cvfx4RJZ3hYkzHPvr4rgIKmX2CRonPFOsYEUdUepOIOwzM6V5cEpksm65U2xOGsr17fAalmcuIFkXtTXrdVpYFSS7Ya5hJupWpk/
+          mqJXiruy2SC108D86EVbjhFLrqImz5oD5lGyIa/zbZcwFTbTDDrmgF/lh3hKfv5C+juga5s3QPuTSzJkqNpKZbs/lVKNXbj7QJ9I
+          q0C5mOyZemEu+Y+WK9OmDhrqPoYbtCZexf1F7b4LVyZGysJopNoLCJMjURVvRYfVHENks0OzNdaQzfUBXLYHAmu1yxirBC4b83dg
+          y1+vny8QckCkaQNzy6X/Lp5hKfyRDpCdc3TaJnR4amdevPJuPBYirIFohQMlq65MvVVBjPNT/8rpWk1sKruh9WUBB1l/wVWTAQkK
+          xB9J9FdWNSf/AnJQrzLFn8ZfB/8i9whGJ5klY00SrfoUIlTGY1UojPYvefoj1V4AfUpqi6FbSBKqZsO7pfbk727XO6KnfH7eteFr
+          mZ/GzuVNBzKdNHcYi6827o9LXD6HZ47OvLxL+nRWGhCagcOYo262kRDzHiKDGGD2a7KqQ/Cf1fsE3l+Mcknh6eRCgL/59uJgRTcO
+          0KKA6lc+kM62Qrndrxi5QY6X+YfgnE4pYNdLWLDAUUQTqQJqJ9OvN7q66OyPnleOtGuR1bUE5+GZqFJWI2G2xTOAIe+h7pt2ajRn
+          3wuZWuoX92aR4QRuys87uhpy/GQXsat9BXbxWMnDx10hlrYw3aZ+VDSq8HL+RijwuRqlpjvI/4TdYX4l20yyPJlwTg6GZ6zvoD/+
+          DFcApovhfCYFxmftvHJIXDiopD67BG3Try/vlE0uVKgTGqUZpfYtbhnl9s+JY4EBnV4O+D/jUnKAb5jY8bbJcVOzB2FFRUDWKplA
+          E6r799ZR1a/ClVrH7y1/NvfsEta8D7tLvyIvITIwHLXjiGeRp8uSzDwHd3Pm+/FwTDzZfe5DrAbdtlGbMIoeACYcwbKrQkCU1rdR
+          doS0LIciKgNeUb5TVtlbDZzx87mQYIgeJZ90rPB9KSjBW5kyD+hoebuOVBME3guDQNYgIQ5cBggCy5OzYrCWzwdwdBqZMqR/y1wa
+          HORv6HLsMne3kayX1RZmdCQkCg4j4JYBlKr6ckO8TNlm5xjEesAlrEBEKTv0WuEFWvanHMXaQc98B72qSe79+w501Wf3IbDfh1Hh
+          bQ6260jtjPUlN5rno7gRyIOhPpfTa2aEc0HW03J0bGaoKtwPgDt/N6XMOQmSxB0a+tdhqwuigwGfz8D93weBMRfZF/wwhn1RLYzY
+          t+1h7sk5LTx/HhnM+yDWrgLW2yvJsTQgahrPFbfk/NE+9Jpvm4/dcUbGc7hNMs9qiHci74c6Vl5pl4WcXnbk9YnjKYEirY+HDa3d
+          vSxehJRb+j+VOc4Rv5b2xIKvytUCUPIf2XZKzVm8mWFT/i/bx+7p/gL6UJ+oFTxIG1CHXjj/fCU+PolJDyHvaIdPJZrHljUHG3Zz
+          xhFAkmJf6Q9RPos1sn/jh3w0XrwEkbUkWUEpI3VLN96qTWem9Z2sAeawCnBCPWRor8JzypuDCVgpSKWpgnI6P92+1KfMxXU5APF1
+          /QbDYABuJ6LYIV4RYsVsHJkKvXCyXVZVpeYhTtbAFtkrJPQAY1k8ZEtG1G/JCUx9GOFbDvdrugg8W8suWFDMVNxit+tRg2Wqou4N
+          FaWElv3EQ7028jrfIq+n7zBJYpwWvPLp9G4xmrhGL8yxue5kkBJ+2RenWqfNBGhdm8hrtAEOfeKa9MHhsflkppWX9ZzrYiSxseyp
+          fZLA58U5/YwKoqWY8J1jFJHwq+s40Og30WgHvSh8xsWRH87shszQklNvkfTFaI4mxsOsRDsisguojoHU/KehAteRyrADlZhev4ls
+          C91VHzYTrKeaSAQaY4eNpuht0lYYK3jWo5UGEAPtB7nEki3134UvIj9Exe7nUtBfGtGS1nRz/rTragdHKRUmrwN/sh/8xBvF6q/s
+          nUfSueRtNaRjyj0cQfZYIMJNcU7QYjexwVhK/GVLT89You1B0FKIvLRJvBT+SYl/GGHG1jE1OqZwWviuj12MDIGl6sXVIBd0Re0U
+          me4B9z/MdbsQU6/B2Ws7WcP/9VVwqvj3h3Ivyqiivw+2G05YWqmQnhtH6YPHLqVfEQNKmg76uWFojb+WWrsl2FqsPiI3Mmk3zYXg
+          qtmy4DRLANWLGqsKi3v6HQXcELDeyl6tDDGkbdyFiaX8s4k1naFAG0qbZvK1bgtc3uTm+3r2b4xgKgiNpPnI1w/08ltZ6FKq5hOl
+          ckjfl64YEPznvSOjhfeLR+IZihM33SAHitZ3bHJgVSbMdz1DSrwDZeFtntDhvohfkA5MvjQeZ59PedM5HqBam7D49bgBxafnrVML
+          /5NFYQDlDPYPjJ/OlXcqMcyvKJy5I3E573hVuNwuuXilMyV/60kEdfmLlMJ4Qtt5AK0zPeRSfOyN9BEiL2WN8MYa5n3nLR44JRYe
+          o8iAnhq/SBBrO81/d5ph60xUq8uxloCCcHpLq5khzTcOyRRJ13h92bA0q9egAupKHPV0vlWY8RoAA7x20tNYxRK/RbbW3/kfxaYP
+          ZcFJitJXp9uYJl0dU7QFL1B6JHpF63bSs2Tavj57uqZjFmNVmNqSY5btIghfS8ecOYhrn2lUrapLJwQqzmWFzjBbbAEk+zdybub4
+          l6/jUrTiSBq88nxDjoqHNWQqnl6SNKFLglExGrLmo9ZjHkKrm22poSxLCBxXiE5/aNDMEKKBpmnLKpajgGdUngz7LXxwxP7XjPkM
+          H5bx0fkjxDIcMixGp44RpbZwAAAAAAAAAAAAAAAAAAAA
           CERBEOF
 
       - name: Compilar APK
