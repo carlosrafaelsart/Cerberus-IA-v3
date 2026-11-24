@@ -1093,11 +1093,9 @@ jobs:
                       Bus.emit("idle", "Reconocimiento de voz no disponible en este teléfono.")
                       return
                   }
-                  var r = rec
-                  if (r == null) {
-                      r = SpeechRecognizer.createSpeechRecognizer(this)
-                      r.setRecognitionListener(listener)
-                      rec = r
+                  val r: SpeechRecognizer = rec ?: SpeechRecognizer.createSpeechRecognizer(this).also {
+                      it.setRecognitionListener(listener)
+                      rec = it
                   }
                   try {
                       r.startListening(recIntent())
