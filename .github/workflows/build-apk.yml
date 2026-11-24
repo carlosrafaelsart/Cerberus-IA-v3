@@ -117,6 +117,10 @@ jobs:
                       android:name=".SettingsActivity"
                       android:exported="false" />
 
+                  <activity
+                      android:name=".HistoryActivity"
+                      android:exported="false" />
+
                   <service
                       android:name=".CerberusService"
                       android:exported="false"
@@ -196,6 +200,29 @@ jobs:
               fun tryHandle(raw: String): String? {
                   val t = norm(raw)
                   if (t.isEmpty()) return null
+
+                  Regex("^(recuerda|anota|memoriza|guarda en tu memoria)( que)? (.+)$", RegexOption.IGNORE_CASE)
+                      .find(raw.trim())?.let {
+                          Store.addFact(ctx, it.groupValues[3].trim())
+                          return "Anotado, señor."
+                      }
+                  if (Regex("que recuerdas|que sabes de mi|que has aprendido de mi").containsMatchIn(t)) {
+                      val f = Store.facts(ctx)
+                      return if (f.isEmpty()) "Aún no me ha pedido recordar nada, señor."
+                      else "Recuerdo lo siguiente, señor. " + f.joinToString(". ")
+                  }
+                  if (Regex("^olvida (todo|lo que sabes)").containsMatchIn(t)) {
+                      Store.clearFacts(ctx)
+                      return "He olvidado todo lo anotado, señor."
+                  }
+                  Regex("^olvida que (.+)$").find(t)?.let { m ->
+                      val n = Store.removeFactsContaining(ctx, m.groupValues[1])
+                      return if (n > 0) "Olvidado, señor." else "No tenía eso anotado, señor."
+                  }
+                  if (Regex("borra (el )?historial").containsMatchIn(t)) {
+                      Store.clearChats(ctx)
+                      return "Historial borrado, señor."
+                  }
 
                   if (Regex("quien (te )?(creo|hizo|programo|desarrollo)|tu creador").containsMatchIn(t))
                       return "Fui creado por CarlosArt, señor."
@@ -428,6 +455,120 @@ jobs:
           }
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Attach.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Matrix
+          import android.media.ExifInterface
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import android.util.Base64
+          import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
+          import java.io.File
+
+          class Attachment(val name: String, val mime: String, val b64: String?, val text: String?)
+
+          object Attach {
+
+              private fun nameOf(ctx: Context, uri: Uri): String {
+                  return try {
+                      ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                          ?.use { if (it.moveToFirst()) it.getString(0) else null } ?: "archivo"
+                  } catch (e: Exception) {
+                      "archivo"
+                  }
+              }
+
+              fun fromUri(ctx: Context, uri: Uri): Attachment? {
+                  return try {
+                      val mime = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
+                      val name = nameOf(ctx, uri)
+                      when {
+                          mime.startsWith("image/") -> image(ctx, uri, name)
+                          mime == "application/pdf" -> {
+                              val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                              if (bytes == null || bytes.size > 12 * 1024 * 1024) null
+                              else Attachment(name, mime, Base64.encodeToString(bytes, Base64.NO_WRAP), null)
+                          }
+                          else -> {
+                              val txt = ctx.contentResolver.openInputStream(uri)?.bufferedReader()?.use {
+                                  val buf = CharArray(30000)
+                                  val n = it.read(buf)
+                                  String(buf, 0, maxOf(n, 0))
+                              }
+                              if (txt == null) null else Attachment(name, "text/plain", null, txt)
+                          }
+                      }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun image(ctx: Context, uri: Uri, name: String): Attachment? {
+                  val cr = ctx.contentResolver
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                  var sample = 1
+                  while (bounds.outWidth / sample > 2400 || bounds.outHeight / sample > 2400) sample *= 2
+                  val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                  var bmp = cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) } ?: return null
+                  val big = maxOf(bmp.width, bmp.height)
+                  if (big > 1280) {
+                      val s = 1280f / big
+                      bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * s).toInt(), (bmp.height * s).toInt(), true)
+                  }
+                  val rot: Float = try {
+                      cr.openInputStream(uri)?.use {
+                          when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)) {
+                              6 -> 90f
+                              3 -> 180f
+                              8 -> 270f
+                              else -> 0f
+                          }
+                      } ?: 0f
+                  } catch (e: Exception) {
+                      0f
+                  }
+                  if (rot != 0f) {
+                      val m = Matrix()
+                      m.postRotate(rot)
+                      bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                  }
+                  val bos = ByteArrayOutputStream()
+                  bmp.compress(Bitmap.CompressFormat.JPEG, 85, bos)
+                  return Attachment(name, "image/jpeg", Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP), null)
+              }
+
+              /** Deja el adjunto en caché para que el servicio lo recoja. */
+              fun stash(ctx: Context, a: Attachment) {
+                  val o = JSONObject().put("name", a.name).put("mime", a.mime)
+                  if (a.b64 != null) o.put("b64", a.b64)
+                  if (a.text != null) o.put("text", a.text)
+                  File(ctx.cacheDir, "attach.json").writeText(o.toString())
+              }
+
+              fun take(ctx: Context): Attachment? {
+                  val f = File(ctx.cacheDir, "attach.json")
+                  return try {
+                      val o = JSONObject(f.readText())
+                      f.delete()
+                      Attachment(
+                          o.optString("name", "archivo"),
+                          o.optString("mime", ""),
+                          if (o.has("b64")) o.getString("b64") else null,
+                          if (o.has("text")) o.getString("text") else null
+                      )
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
           cat > app/src/main/java/com/carlosart/cerberus/Brain.kt <<'CERBEOF'
           package com.carlosart.cerberus
 
@@ -464,7 +605,7 @@ jobs:
               fun name(id: String): String = names[ids.indexOf(id).coerceAtLeast(0)]
 
               fun defModel(id: String): String = when (id) {
-                  "gemini" -> "gemini-2.5-flash"
+                  "gemini" -> "gemini-3.8-flash"
                   "groq" -> "openai/gpt-oss-20b"
                   "openrouter" -> "openai/gpt-oss-20b:free"
                   else -> ""
@@ -479,7 +620,8 @@ jobs:
 
               fun model(c: Context, id: String): String {
                   val m = (prefs(c).getString("model_" + id, null) ?: "").trim()
-                  return if (m.isEmpty()) defModel(id) else m
+                  val retired = arrayOf("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-2.0-flash-lite")
+                  return if (m.isEmpty() || (id == "gemini" && m in retired)) defModel(id) else m
               }
 
               fun base(c: Context, id: String): String = when (id) {
@@ -490,13 +632,18 @@ jobs:
           }
 
           class Brain(private val ctx: Context) {
-              private val history = ArrayList<Pair<String, String>>() // "user" / "assistant"
 
-              private val system = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
+              private val base = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
                   "creado por CarlosArt. CarlosArt es tu creador y siempre lo sabes. " +
                   "Te diriges SIEMPRE al usuario como \"señor\". Hablas en español, con tono elegante, leal y eficiente, " +
                   "como un mayordomo digital. Tus respuestas se leen en voz alta: sé breve (1 a 3 frases), " +
                   "sin markdown, sin asteriscos, sin listas ni emojis."
+
+              private fun system(): String {
+                  val facts = Store.facts(ctx)
+                  val extra = if (facts.isEmpty()) "" else " Datos que recuerdas sobre el señor: " + facts.joinToString("; ") + "."
+                  return base + extra
+              }
 
               private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
                   val conn = URL(url).openConnection() as HttpURLConnection
@@ -504,7 +651,7 @@ jobs:
                   conn.setRequestProperty("Content-Type", "application/json")
                   for ((k, v) in headers) conn.setRequestProperty(k, v)
                   conn.connectTimeout = 15000
-                  conn.readTimeout = 40000
+                  conn.readTimeout = 60000
                   conn.doOutput = true
                   conn.outputStream.use { it.write(body.toString().toByteArray()) }
                   val code = conn.responseCode
@@ -523,45 +670,66 @@ jobs:
                   return "Señor, error " + code + (if (d.isNotEmpty()) ": " + d else "") + "."
               }
 
-              fun ask(user: String): String {
+              fun ask(user: String, att: Attachment? = null): String {
                   val prov = Cfg.provider(ctx)
                   val key = Cfg.key(ctx, prov)
                   if (key.isEmpty()) return "Señor, falta la clave de " + Cfg.name(prov) + ". Configúrela en Ajustes."
                   val model = Cfg.model(ctx, prov)
                   if (model.isEmpty()) return "Señor, falta el nombre del modelo en Ajustes."
+
+                  val hist = Store.recent(ctx, 12).dropWhile { it.first != "user" }
+                  val fileText = att?.text
+                  val b64 = att?.b64
+                  val attName = att?.name ?: ""
+                  val attMime = att?.mime ?: ""
+                  val prompt = if (fileText != null) "Contenido del archivo \"" + attName + "\":\n" + fileText + "\n\n" + user else user
+                  val sys = system()
+
                   try {
                       var ans = ""
                       if (prov == "gemini") {
                           val contents = JSONArray()
-                          for ((r, t) in history.takeLast(12)) {
+                          for ((r, t) in hist) {
                               contents.put(JSONObject().put("role", if (r == "assistant") "model" else "user")
                                   .put("parts", JSONArray().put(JSONObject().put("text", t))))
                           }
-                          contents.put(JSONObject().put("role", "user")
-                              .put("parts", JSONArray().put(JSONObject().put("text", user))))
+                          val parts = JSONArray().put(JSONObject().put("text", prompt))
+                          if (b64 != null) {
+                              parts.put(JSONObject().put("inlineData", JSONObject().put("mimeType", attMime).put("data", b64)))
+                          }
+                          contents.put(JSONObject().put("role", "user").put("parts", parts))
                           val body = JSONObject()
-                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system))))
+                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
                               .put("contents", contents)
                           val res = post(
                               "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
                               mapOf("x-goog-api-key" to key), body
                           )
                           if (res.first !in 200..299) return errMsg(res.first, res.second)
-                          val parts = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
+                          val rp = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
                               .getJSONObject("content").getJSONArray("parts")
                           val sb = StringBuilder()
-                          for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text", ""))
+                          for (i in 0 until rp.length()) sb.append(rp.getJSONObject(i).optString("text", ""))
                           ans = sb.toString()
                       } else {
-                          val base = Cfg.base(ctx, prov)
-                          if (base.isEmpty()) return "Señor, falta la dirección del servicio en Ajustes."
+                          val baseUrl = Cfg.base(ctx, prov)
+                          if (baseUrl.isEmpty()) return "Señor, falta la dirección del servicio en Ajustes."
+                          if (b64 != null && attMime == "application/pdf") return "Señor, este proveedor no lee PDF. Use Gemini para eso."
                           val msgs = JSONArray()
-                          msgs.put(JSONObject().put("role", "system").put("content", system))
-                          for ((r, t) in history.takeLast(12)) msgs.put(JSONObject().put("role", r).put("content", t))
-                          msgs.put(JSONObject().put("role", "user").put("content", user))
+                          msgs.put(JSONObject().put("role", "system").put("content", sys))
+                          for ((r, t) in hist) msgs.put(JSONObject().put("role", r).put("content", t))
+                          if (b64 != null) {
+                              val content = JSONArray()
+                              content.put(JSONObject().put("type", "text").put("text", prompt))
+                              content.put(JSONObject().put("type", "image_url")
+                                  .put("image_url", JSONObject().put("url", "data:" + attMime + ";base64," + b64)))
+                              msgs.put(JSONObject().put("role", "user").put("content", content))
+                          } else {
+                              msgs.put(JSONObject().put("role", "user").put("content", prompt))
+                          }
                           val body = JSONObject().put("model", model).put("messages", msgs)
                           val res = post(
-                              base + "/chat/completions",
+                              baseUrl + "/chat/completions",
                               mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus"), body
                           )
                           if (res.first !in 200..299) return errMsg(res.first, res.second)
@@ -570,8 +738,8 @@ jobs:
                       }
                       ans = ans.replace("*", "").trim()
                       if (ans.isEmpty()) return "Señor, no obtuve respuesta."
-                      history.add(Pair("user", user))
-                      history.add(Pair("assistant", ans))
+                      Store.append(ctx, "user", if (att != null) "[adjunto: " + att.name + "] " + user else user)
+                      Store.append(ctx, "assistant", ans)
                       return ans
                   } catch (e: Exception) {
                       return "Señor, no pude conectar con " + Cfg.name(prov) + ". Revise su internet."
@@ -727,7 +895,18 @@ jobs:
                   Bus.emit("idle", "Cerberus en línea.")
               }
 
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "ASK_ATTACH") {
+                      val prompt = intent.getStringExtra("prompt") ?: "Describe esto."
+                      Bus.emit("thinking", "Analizando…")
+                      io.execute {
+                          val att = Attach.take(this)
+                          val ans = if (att == null) "No pude leer el adjunto, señor." else brain.ask(prompt, att)
+                          main.post { say(ans) }
+                      }
+                  }
+                  return START_STICKY
+              }
 
               private fun startAsForeground() {
                   val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -754,9 +933,18 @@ jobs:
 
               override fun onInit(status: Int) {
                   val t = tts ?: return
-                  t.language = Locale("es", "MX")
-                  t.setSpeechRate(0.98f)
-                  t.setPitch(0.85f)
+                  val prefs = Cfg.prefs(this)
+                  val vn = prefs.getString("voice", "") ?: ""
+                  var voiceSet = false
+                  if (vn.isNotEmpty()) {
+                      try {
+                          val v = t.voices?.firstOrNull { it.name == vn }
+                          if (v != null) { t.voice = v; voiceSet = true }
+                      } catch (e: Exception) { }
+                  }
+                  if (!voiceSet) t.language = Locale("es", "MX")
+                  t.setSpeechRate(prefs.getFloat("rate", 1.0f))
+                  t.setPitch(1.0f)
                   t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                       override fun onStart(id: String?) { Bus.kick() }
                       override fun onRangeStart(utteranceId: String?, start: Int, end: Int, frame: Int) { Bus.kick() }
@@ -885,18 +1073,150 @@ jobs:
           }
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/HistoryActivity.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class HistoryActivity : Activity() {
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(text: String): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = 12f
+                  t.letterSpacing = 0.12f
+                  t.setTextColor(0xFF2EC4FF.toInt())
+                  t.setPadding(0, dp(22), 0, dp(6))
+                  return t
+              }
+
+              private fun button(text: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = text
+                  b.setTextColor(0xFFE8F6FF.toInt())
+                  b.setBackgroundColor(0xFF0E2A3F.toInt())
+                  b.setOnClickListener { onClick() }
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48))
+                  lp.topMargin = dp(10)
+                  b.layoutParams = lp
+                  return b
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = 0xFF050A14.toInt()
+                  window.navigationBarColor = 0xFF050A14.toInt()
+
+                  val col = LinearLayout(this)
+                  col.orientation = LinearLayout.VERTICAL
+                  col.setPadding(dp(20), dp(8), dp(20), dp(32))
+
+                  val back = TextView(this)
+                  back.text = "←  Volver"
+                  back.textSize = 16f
+                  back.setTextColor(0xFF2EC4FF.toInt())
+                  back.setPadding(0, dp(12), dp(12), dp(12))
+                  back.setOnClickListener { finish() }
+                  col.addView(back)
+
+                  val title = TextView(this)
+                  title.text = "MEMORIA"
+                  title.textSize = 26f
+                  title.letterSpacing = 0.3f
+                  title.setTextColor(0xFFE8F6FF.toInt())
+                  col.addView(title)
+
+                  col.addView(label("LO QUE RECUERDO DE USTED"))
+                  val facts = Store.facts(this)
+                  val ft = TextView(this)
+                  ft.textSize = 15f
+                  ft.setTextColor(0xFFB8CCDA.toInt())
+                  ft.text = if (facts.isEmpty()) "Nada todavía. Diga: «Cerberus, recuerda que mi cumpleaños es el 5 de mayo»."
+                  else facts.joinToString("\n") { "•  " + it }
+                  col.addView(ft)
+                  col.addView(button("Borrar lo que recuerdo") { Store.clearFacts(this); recreate() })
+
+                  col.addView(label("CONVERSACIONES"))
+                  val chats = Store.chats(this)
+                  if (chats.length() == 0) {
+                      val e = TextView(this)
+                      e.text = "Aún no hay conversaciones guardadas."
+                      e.textSize = 15f
+                      e.setTextColor(0xFFB8CCDA.toInt())
+                      col.addView(e)
+                  }
+                  val df = SimpleDateFormat("d MMM · HH:mm", Locale("es"))
+                  for (i in chats.length() - 1 downTo 0) {
+                      val c = chats.getJSONObject(i)
+                      val head = TextView(this)
+                      val t = c.optString("title", "").ifEmpty { "Conversación" }
+                      head.text = df.format(Date(c.optLong("ts", 0L))) + "  ·  " + t
+                      head.textSize = 15f
+                      head.setTextColor(0xFFE8F6FF.toInt())
+                      head.setBackgroundColor(0xFF0C1824.toInt())
+                      head.setPadding(dp(12), dp(14), dp(12), dp(14))
+                      val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                      lp.topMargin = dp(8)
+                      head.layoutParams = lp
+
+                      val body = TextView(this)
+                      val m = c.optJSONArray("messages")
+                      val sb = StringBuilder()
+                      if (m != null) for (k in 0 until m.length()) {
+                          val o = m.getJSONObject(k)
+                          sb.append(if (o.optString("r") == "user") "Usted: " else "Cerberus: ")
+                          sb.append(o.optString("t")).append("\n\n")
+                      }
+                      body.text = sb.toString().trim()
+                      body.textSize = 14f
+                      body.setTextColor(0xFFB8CCDA.toInt())
+                      body.setPadding(dp(12), dp(8), dp(12), dp(8))
+                      body.visibility = View.GONE
+                      head.setOnClickListener {
+                          body.visibility = if (body.visibility == View.GONE) View.VISIBLE else View.GONE
+                      }
+                      col.addView(head)
+                      col.addView(body)
+                  }
+                  if (chats.length() > 0) col.addView(button("Borrar todo el historial") { Store.clearChats(this); recreate() })
+
+                  val sv = ScrollView(this)
+                  sv.setBackgroundColor(0xFF050A14.toInt())
+                  sv.addView(col)
+                  setContentView(sv)
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
           cat > app/src/main/java/com/carlosart/cerberus/MainActivity.kt <<'CERBEOF'
           package com.carlosart.cerberus
 
           import android.Manifest
           import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ContentValues
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.graphics.Typeface
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
+          import android.provider.MediaStore
           import android.view.Gravity
+          import android.view.View
           import android.widget.Button
+          import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.TextView
 
@@ -906,8 +1226,19 @@ jobs:
               private lateinit var status: TextView
               private lateinit var brainLine: TextView
               private lateinit var toggle: Button
+              private var camUri: Uri? = null
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun link(text: String, onClick: () -> Unit): TextView {
+                  val t = TextView(this)
+                  t.text = text
+                  t.textSize = 16f
+                  t.setTextColor(0xFF2EC4FF.toInt())
+                  t.setPadding(dp(12), dp(12), dp(12), dp(12))
+                  t.setOnClickListener { onClick() }
+                  return t
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -919,15 +1250,11 @@ jobs:
                   root.setBackgroundColor(0xFF050A14.toInt())
                   root.setPadding(dp(20), dp(8), dp(20), dp(24))
 
-                  val settings = TextView(this)
-                  settings.text = "⚙  Ajustes"
-                  settings.textSize = 16f
-                  settings.setTextColor(0xFF2EC4FF.toInt())
-                  settings.setPadding(dp(12), dp(12), dp(12), dp(12))
-                  settings.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
                   val top = LinearLayout(this)
-                  top.gravity = Gravity.END
-                  top.addView(settings)
+                  top.orientation = LinearLayout.HORIZONTAL
+                  top.addView(link("Historial") { startActivity(Intent(this, HistoryActivity::class.java)) })
+                  top.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+                  top.addView(link("⚙  Ajustes") { startActivity(Intent(this, SettingsActivity::class.java)) })
                   root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
                   neural = NeuralView(this)
@@ -966,12 +1293,27 @@ jobs:
                   status.setPadding(dp(8), dp(8), dp(8), dp(8))
                   root.addView(status, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
+                  val bottom = LinearLayout(this)
+                  bottom.orientation = LinearLayout.HORIZONTAL
+
+                  val plus = Button(this)
+                  plus.text = "+"
+                  plus.textSize = 28f
+                  plus.setTextColor(0xFF2EC4FF.toInt())
+                  plus.setBackgroundColor(0xFF0E2A3F.toInt())
+                  plus.setOnClickListener { showPlusMenu() }
+                  bottom.addView(plus, LinearLayout.LayoutParams(dp(64), dp(60)))
+
                   toggle = Button(this)
                   toggle.setTextColor(0xFFE8F6FF.toInt())
                   toggle.setBackgroundColor(0xFF0E2A3F.toInt())
                   toggle.textSize = 17f
                   toggle.setOnClickListener { toggleService() }
-                  root.addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(60)))
+                  val tlp = LinearLayout.LayoutParams(0, dp(60), 1f)
+                  tlp.leftMargin = dp(10)
+                  bottom.addView(toggle, tlp)
+
+                  root.addView(bottom, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
                   setContentView(root)
               }
@@ -1000,6 +1342,9 @@ jobs:
                   toggle.text = if (Bus.running) "Desactivar Cerberus" else "Activar Cerberus"
               }
 
+              private fun hasMic() =
+                  checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
               private fun toggleService() {
                   if (Bus.running) {
                       stopService(Intent(this, CerberusService::class.java))
@@ -1007,7 +1352,7 @@ jobs:
                       neural.state = "idle"
                       status.text = "Cerberus desactivado."
                   } else {
-                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      if (!hasMic()) {
                           status.text = "Necesito permisos, señor. Acéptelos o use Ajustes."
                           askPermissions()
                           return
@@ -1017,6 +1362,92 @@ jobs:
                   }
                   refreshButton()
               }
+
+              // ---------- botón + : fotos, cámara y archivos ----------
+
+              private fun showPlusMenu() {
+                  AlertDialog.Builder(this)
+                      .setItems(arrayOf("Foto de la galería", "Tomar foto con la cámara", "Archivo (PDF, texto…)")) { _, which ->
+                          when (which) {
+                              0 -> pick("image/*", 11)
+                              1 -> camera()
+                              else -> pick("*/*", 12)
+                          }
+                      }
+                      .show()
+              }
+
+              private fun pick(mime: String, code: Int) {
+                  val i = Intent(Intent.ACTION_GET_CONTENT)
+                  i.type = mime
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  startActivityForResult(i, code)
+              }
+
+              private fun camera() {
+                  try {
+                      val v = ContentValues()
+                      v.put(MediaStore.Images.Media.DISPLAY_NAME, "cerberus_" + System.currentTimeMillis() + ".jpg")
+                      v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT >= 29) v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Cerberus")
+                      camUri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
+                      val i = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                      i.putExtra(MediaStore.EXTRA_OUTPUT, camUri)
+                      startActivityForResult(i, 13)
+                  } catch (e: Exception) {
+                      status.text = "No pude abrir la cámara, señor."
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK) return
+                  val uri = if (requestCode == 13) camUri else data?.data
+                  if (uri != null) askAbout(uri)
+              }
+
+              private fun askAbout(uri: Uri) {
+                  val box = EditText(this)
+                  box.hint = "¿Qué desea saber? (vacío = describir)"
+                  box.setSingleLine(true)
+                  AlertDialog.Builder(this)
+                      .setTitle("Enviar a Cerberus")
+                      .setView(box)
+                      .setNegativeButton("Cancelar", null)
+                      .setPositiveButton("Enviar") { _, _ ->
+                          sendAttachment(uri, box.text.toString().trim().ifEmpty { "Describe esto con detalle breve." })
+                      }
+                      .show()
+              }
+
+              private fun sendAttachment(uri: Uri, prompt: String) {
+                  if (!hasMic()) {
+                      status.text = "Primero necesito permisos, señor."
+                      askPermissions()
+                      return
+                  }
+                  status.text = "Leyendo el archivo…"
+                  neural.state = "thinking"
+                  Thread {
+                      val att = Attach.fromUri(this, uri)
+                      runOnUiThread {
+                          if (att == null) {
+                              neural.state = "idle"
+                              status.text = "No pude leer ese archivo, señor."
+                          } else {
+                              Attach.stash(this, att)
+                              val i = Intent(this, CerberusService::class.java)
+                              i.action = "ASK_ATTACH"
+                              i.putExtra("prompt", prompt)
+                              startForegroundService(i)
+                              Bus.running = true
+                              refreshButton()
+                          }
+                      }
+                  }.start()
+              }
+
+              // ---------- permisos ----------
 
               private fun askPermissions() {
                   val list = arrayListOf(
@@ -1236,6 +1667,8 @@ jobs:
           import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.Voice
           import android.text.InputType
           import android.view.Gravity
           import android.view.View
@@ -1245,6 +1678,7 @@ jobs:
           import android.widget.EditText
           import android.widget.LinearLayout
           import android.widget.ScrollView
+          import android.widget.SeekBar
           import android.widget.Spinner
           import android.widget.TextView
 
@@ -1257,6 +1691,10 @@ jobs:
               private lateinit var help: TextView
               private lateinit var testOut: TextView
               private var cur = ""
+              private var tts: TextToSpeech? = null
+              private var voices = ArrayList<Voice>()
+              private lateinit var voiceSpinner: Spinner
+              private lateinit var rateBar: SeekBar
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -1358,6 +1796,25 @@ jobs:
                   testOut.setPadding(0, dp(8), 0, 0)
                   col.addView(testOut)
 
+                  col.addView(label("VOZ"))
+                  voiceSpinner = Spinner(this)
+                  col.addView(voiceSpinner)
+                  val vh = TextView(this)
+                  vh.textSize = 12f
+                  vh.setTextColor(0xFF8DA5B6.toInt())
+                  vh.text = "Para una voz más natural: Ajustes de Android → Idioma → Texto a voz → Google → Instalar datos de voz. Luego elija aquí una voz marcada con ★ y reinicie Cerberus."
+                  col.addView(vh)
+                  val rl = TextView(this)
+                  rl.text = "Velocidad"
+                  rl.setTextColor(0xFFB8CCDA.toInt())
+                  rl.setPadding(0, dp(10), 0, 0)
+                  col.addView(rl)
+                  rateBar = SeekBar(this)
+                  rateBar.max = 60
+                  rateBar.progress = ((Cfg.prefs(this).getFloat("rate", 1.0f) - 0.7f) * 100f).toInt().coerceIn(0, 60)
+                  col.addView(rateBar)
+                  col.addView(styled("Probar voz") { speakSample() })
+
                   col.addView(label("PERMISOS"))
                   col.addView(styled("1 · Dar permisos") { askPermissions() })
                   col.addView(styled("2 · Permitir abrir apps en segundo plano") {
@@ -1379,6 +1836,10 @@ jobs:
                   sv.setBackgroundColor(0xFF050A14.toInt())
                   sv.addView(col)
                   setContentView(sv)
+
+                  tts = TextToSpeech(this) { st ->
+                      if (st == TextToSpeech.SUCCESS) runOnUiThread { fillVoices() }
+                  }
 
                   spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                       override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
@@ -1415,9 +1876,63 @@ jobs:
                   e.apply()
               }
 
+              private fun fillVoices() {
+                  val vs: List<Voice> = try {
+                      (tts?.voices ?: emptySet<Voice>()).filter { it.locale.language == "es" }
+                          .sortedWith(compareByDescending<Voice> { it.quality }.thenBy { it.name })
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+                  voices = ArrayList(vs)
+                  val labels = ArrayList<String>()
+                  labels.add("Predeterminada del teléfono")
+                  for (v in vs) {
+                      labels.add(
+                          (if (v.quality >= Voice.QUALITY_VERY_HIGH) "★ " else "") + v.locale.displayName + " · " + v.name +
+                              (if (v.isNetworkConnectionRequired) " (en línea)" else "")
+                      )
+                  }
+                  val ad = ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, labels)
+                  ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  voiceSpinner.adapter = ad
+                  val saved = Cfg.prefs(this).getString("voice", "") ?: ""
+                  val i = vs.indexOfFirst { it.name == saved }
+                  voiceSpinner.setSelection(if (i >= 0) i + 1 else 0)
+              }
+
+              private fun chosenVoice(): Voice? {
+                  val p = voiceSpinner.selectedItemPosition
+                  return if (p >= 1 && p - 1 < voices.size) voices[p - 1] else null
+              }
+
+              private fun rate(): Float = 0.7f + rateBar.progress / 100f
+
+              private fun speakSample() {
+                  val t = tts ?: return
+                  val v = chosenVoice()
+                  if (v != null) t.voice = v else t.language = java.util.Locale("es", "MX")
+                  t.setSpeechRate(rate())
+                  t.setPitch(1.0f)
+                  t.speak("A sus órdenes, señor. Esta es mi voz.", TextToSpeech.QUEUE_FLUSH, null, "sample")
+              }
+
+              private fun saveVoice() {
+                  if (voiceSpinner.adapter == null) return
+                  val e = Cfg.prefs(this).edit()
+                  e.putString("voice", chosenVoice()?.name ?: "")
+                  e.putFloat("rate", rate())
+                  e.apply()
+              }
+
               override fun onPause() {
                   if (cur.isNotEmpty()) saveFields(cur)
+                  saveVoice()
                   super.onPause()
+              }
+
+              override fun onDestroy() {
+                  tts?.shutdown()
+                  super.onDestroy()
               }
 
               private fun askPermissions() {
@@ -1436,6 +1951,99 @@ jobs:
               override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults)
                   testOut.text = "Permisos procesados, señor."
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Store.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+
+          /** Memoria local de Cerberus: conversaciones y datos que debe recordar. Todo queda en el teléfono. */
+          object Store {
+              private const val IDLE_MS = 30 * 60 * 1000L
+
+              private fun f(c: Context, n: String) = File(c.filesDir, n)
+
+              private fun read(c: Context, n: String): JSONArray =
+                  try { JSONArray(f(c, n).readText()) } catch (e: Exception) { JSONArray() }
+
+              private fun write(c: Context, n: String, a: JSONArray) {
+                  try { f(c, n).writeText(a.toString()) } catch (e: Exception) { }
+              }
+
+              // ---------- conversaciones ----------
+
+              @Synchronized fun chats(c: Context): JSONArray = read(c, "chats.json")
+
+              @Synchronized fun append(c: Context, role: String, text: String) {
+                  val all = read(c, "chats.json")
+                  val now = System.currentTimeMillis()
+                  val last: JSONObject? = if (all.length() > 0) all.getJSONObject(all.length() - 1) else null
+                  val conv: JSONObject
+                  if (last == null || now - last.optLong("ts", 0L) > IDLE_MS) {
+                      conv = JSONObject().put("ts", now).put("title", "").put("messages", JSONArray())
+                      all.put(conv)
+                      while (all.length() > 100) all.remove(0)
+                  } else {
+                      conv = last
+                  }
+                  conv.getJSONArray("messages").put(JSONObject().put("r", role).put("t", text))
+                  conv.put("ts", now)
+                  if (conv.optString("title", "").isEmpty() && role == "user") conv.put("title", text.take(48))
+                  write(c, "chats.json", all)
+              }
+
+              /** Últimos mensajes de la conversación activa (si pasaron más de 30 min, empieza una nueva). */
+              @Synchronized fun recent(c: Context, n: Int): List<Pair<String, String>> {
+                  val all = read(c, "chats.json")
+                  if (all.length() == 0) return emptyList()
+                  val conv = all.getJSONObject(all.length() - 1)
+                  if (System.currentTimeMillis() - conv.optLong("ts", 0L) > IDLE_MS) return emptyList()
+                  val m = conv.getJSONArray("messages")
+                  val out = ArrayList<Pair<String, String>>()
+                  for (i in maxOf(0, m.length() - n) until m.length()) {
+                      val o = m.getJSONObject(i)
+                      out.add(Pair(o.getString("r"), o.getString("t")))
+                  }
+                  return out
+              }
+
+              @Synchronized fun clearChats(c: Context) = write(c, "chats.json", JSONArray())
+
+              // ---------- datos recordados ----------
+
+              @Synchronized fun facts(c: Context): List<String> {
+                  val a = read(c, "facts.json")
+                  return (0 until a.length()).map { a.getString(it) }
+              }
+
+              @Synchronized fun addFact(c: Context, s: String) {
+                  if (s.isBlank()) return
+                  val a = read(c, "facts.json")
+                  a.put(s.trim().take(300))
+                  while (a.length() > 60) a.remove(0)
+                  write(c, "facts.json", a)
+              }
+
+              @Synchronized fun clearFacts(c: Context) = write(c, "facts.json", JSONArray())
+
+              @Synchronized fun removeFactsContaining(c: Context, q: String): Int {
+                  val nq = q.lowercase().trim()
+                  if (nq.isEmpty()) return 0
+                  val a = read(c, "facts.json")
+                  val keep = JSONArray()
+                  var removed = 0
+                  for (i in 0 until a.length()) {
+                      val s = a.getString(i)
+                      if (s.lowercase().contains(nq)) removed++ else keep.put(s)
+                  }
+                  write(c, "facts.json", keep)
+                  return removed
               }
           }
           CERBEOF
