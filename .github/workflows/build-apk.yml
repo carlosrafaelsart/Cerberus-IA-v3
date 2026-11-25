@@ -193,6 +193,8 @@ jobs:
           import android.os.BatteryManager
           import android.os.Build
           import android.provider.ContactsContract
+          import android.telephony.PhoneNumberUtils
+          import android.telephony.TelephonyManager
           import android.telecom.TelecomManager
           import java.net.URLEncoder
           import java.text.Normalizer
@@ -218,6 +220,15 @@ jobs:
               fun tryHandle(raw: String): String? {
                   val t = norm(raw)
                   if (t.isEmpty()) return null
+
+                  Tools.takePending()?.let { pd ->
+                      if (Regex("^(si|sip|claro|adelante|confirmo|confirmado|dale|hazlo|correcto|afirmativo|ok|okay|enviar|enviado|envialo|llamalo|por supuesto)( |$)").containsMatchIn(t))
+                          return Tools.run(ctx, this, pd.first, pd.second)
+                      if (Regex("^(no|cancela|cancelar|negativo|detente|para|nada)( |$)").containsMatchIn(t))
+                          return "Cancelado, señor."
+                  }
+                  // Todo lo que mencione WhatsApp lo resuelve la IA con sus herramientas (entiende acentos y frases libres).
+                  if (t.contains("whatsapp") || t.contains("wasap") || t.contains("guasap")) return null
 
                   Regex("^(recuerda|anota|memoriza|guarda en tu memoria)( que)? (.+)$", RegexOption.IGNORE_CASE)
                       .find(raw.trim())?.let {
@@ -283,8 +294,6 @@ jobs:
                   val needAcc = "Señor, active primero la accesibilidad de Cerberus con el botón 4."
                   fun acc(block: (CerberusAccess) -> String): String = CerberusAccess.inst?.let(block) ?: needAcc
 
-                  Regex("^(manda|envia|enviale|mandale|escribe) (un )?(whatsapp|mensaje) a (.+?) (diciendo|que diga|con el mensaje|y dile que|y dile|dile que|dile) (.+)$", RegexOption.IGNORE_CASE)
-                      .find(raw.trim())?.let { return whatsapp(it.groupValues[4], it.groupValues[6]) }
 
                   if (Regex("^(ve |ir |vuelve )?(al |a la |a )?(inicio|pantalla de inicio|pantalla principal)$").containsMatchIn(t))
                       return acc { it.global(AccessibilityService.GLOBAL_ACTION_HOME); "Hecho, señor." }
@@ -342,7 +351,7 @@ jobs:
                   }
               }
 
-              private fun openApp(name: String): String {
+              fun openApp(name: String): String {
                   val pm = ctx.packageManager
                   val li = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                   val apps = pm.queryIntentActivities(li, 0)
@@ -355,7 +364,7 @@ jobs:
                   return launch(intent, "Abriendo $name, señor.")
               }
 
-              private fun torch(on: Boolean): String {
+              fun torch(on: Boolean): String {
                   return try {
                       val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
                       val id = cm.cameraIdList.first {
@@ -368,7 +377,7 @@ jobs:
                   }
               }
 
-              private fun call(name: String): String {
+              fun call(name: String): String {
                   if (!has(Manifest.permission.READ_CONTACTS)) return "Señor, necesito permiso para leer sus contactos."
                   if (!has(Manifest.permission.CALL_PHONE)) return "Señor, necesito permiso para realizar llamadas."
                   val q = norm(name)
@@ -393,7 +402,7 @@ jobs:
                   return launch(Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(num))), "Llamando a $bestName, señor.")
               }
 
-              private fun answer(): String {
+              fun answer(): String {
                   if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) return "Señor, me falta el permiso para contestar llamadas."
                   return try {
                       (ctx.getSystemService(Context.TELECOM_SERVICE) as TelecomManager).acceptRingingCall()
@@ -403,7 +412,7 @@ jobs:
                   }
               }
 
-              private fun hangup(): String {
+              fun hangup(): String {
                   if (Build.VERSION.SDK_INT < 28) return "Su versión de Android no me permite colgar, señor."
                   if (!has(Manifest.permission.ANSWER_PHONE_CALLS)) return "Señor, me falta el permiso para colgar llamadas."
                   return try {
@@ -436,23 +445,103 @@ jobs:
                   return best
               }
 
-              private fun whatsapp(name: String, msg: String): String {
-                  if (!has(Manifest.permission.READ_CONTACTS)) return "Señor, necesito permiso para leer sus contactos."
-                  val found = findContact(name) ?: return "No encuentro a $name en sus contactos, señor."
-                  val cname = found.first
-                  var digits = found.second.filter { it.isDigit() }
-                  // Números locales de 10 dígitos: se asume prefijo 1 (RD/EE.UU./Canadá). Cámbielo aquí si usa otro país.
-                  if (!found.second.trim().startsWith("+") && digits.length == 10) digits = "1" + digits
+              fun volume(up: Boolean): String {
+                  val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  repeat(3) {
+                      am.adjustStreamVolume(
+                          AudioManager.STREAM_MUSIC,
+                          if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
+                          AudioManager.FLAG_SHOW_UI
+                      )
+                  }
+                  return if (up) "Volumen aumentado." else "Volumen reducido."
+              }
+
+              /** Fila de contacto de WhatsApp: (nombre, id de la fila, dato1). Existe solo si WhatsApp sincronizó ese contacto. */
+              private fun waRow(name: String, mime: String): Triple<String, Long, String>? {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return null
+                  val nq = norm(name)
+                  var best: Triple<String, Long, String>? = null
+                  try {
+                      ctx.contentResolver.query(
+                          ContactsContract.Data.CONTENT_URI,
+                          arrayOf(ContactsContract.Data._ID, ContactsContract.Data.DISPLAY_NAME, ContactsContract.Data.DATA1),
+                          ContactsContract.Data.MIMETYPE + "=?", arrayOf(mime), null
+                      )?.use { c ->
+                          while (c.moveToNext()) {
+                              val id = c.getLong(0)
+                              val n = c.getString(1) ?: continue
+                              val d1 = c.getString(2) ?: ""
+                              val nn = norm(n)
+                              if (nn == nq) { best = Triple(n, id, d1); break }
+                              if (best == null && nn.contains(nq)) best = Triple(n, id, d1)
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return best
+              }
+
+              private fun e164(raw: String): String {
+                  val d = raw.filter { it.isDigit() || it == '+' }
+                  if (d.startsWith("+")) return d.drop(1)
+                  if (d.startsWith("00")) return d.drop(2)
+                  var iso = ""
+                  try {
+                      val tm = ctx.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                      iso = tm.simCountryIso
+                      if (iso.isNullOrEmpty()) iso = tm.networkCountryIso
+                  } catch (e: Exception) {
+                  }
+                  if (iso.isNullOrEmpty()) iso = Locale.getDefault().country
+                  val e = PhoneNumberUtils.formatNumberToE164(d, iso.uppercase())
+                  return (e ?: d).filter { it.isDigit() }
+              }
+
+              fun whatsappSend(name: String, msg: String): String {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return "Falta el permiso de contactos. Dígale al señor que lo conceda en Ajustes."
+                  if (msg.isBlank()) return "El mensaje está vacío."
+                  val row = waRow(name, "vnd.android.cursor.item/vnd.com.whatsapp.profile")
+                  val phone = findContact(name)
+                  var digits = ""
+                  var cname = ""
+                  if (row != null && row.third.contains("@")) {
+                      digits = row.third.substringBefore("@").filter { it.isDigit() }
+                      cname = row.first
+                  }
+                  if (digits.isEmpty() && phone != null) {
+                      digits = e164(phone.second)
+                      cname = phone.first
+                  }
+                  if (digits.isEmpty()) return "No encuentro a $name en los contactos."
                   val url = "https://wa.me/" + digits + "?text=" + URLEncoder.encode(msg, "UTF-8")
-                  val i = Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage("com.whatsapp")
-                  if (launch(i, "ok") != "ok") return "No pude abrir WhatsApp, señor."
+                  var opened = false
+                  for (pkg in listOf("com.whatsapp", "com.whatsapp.w4b")) {
+                      if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(pkg), "ok") == "ok") { opened = true; break }
+                  }
+                  if (!opened && launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)), "ok") != "ok")
+                      return "No pude abrir WhatsApp. Puede que no esté instalado o falte el permiso de abrir apps en segundo plano (botón 2)."
                   val acc = CerberusAccess.inst
-                      ?: return "Dejé el mensaje para $cname listo en WhatsApp, señor. Active la accesibilidad para que yo lo envíe."
-                  Thread {
-                      Thread.sleep(3500)
-                      if (!acc.clickId("com.whatsapp:id/send")) acc.clickText("enviar")
-                  }.start()
-                  return "Enviando su mensaje a $cname, señor."
+                      ?: return "Dejé el mensaje para $cname listo en WhatsApp, pero la accesibilidad está desactivada y no puedo pulsar enviar."
+                  for (n in 0 until 20) {
+                      Thread.sleep(500)
+                      if (acc.clickId("com.whatsapp:id/send") || acc.clickId("com.whatsapp.w4b:id/send"))
+                          return "Mensaje enviado a $cname."
+                      if (n >= 6 && acc.clickText("enviar")) return "Mensaje enviado a $cname."
+                  }
+                  return "Dejé el mensaje preparado para $cname, pero no logré pulsar enviar."
+              }
+
+              fun whatsappCall(name: String, video: Boolean): String {
+                  if (!has(Manifest.permission.READ_CONTACTS)) return "Falta el permiso de contactos. Dígale al señor que lo conceda en Ajustes."
+                  val mime = "vnd.android.cursor.item/vnd.com.whatsapp." + (if (video) "video.call" else "voip.call")
+                  val row = waRow(name, mime)
+                      ?: return "No encuentro a $name con llamadas de WhatsApp. Puede que no tenga WhatsApp o que WhatsApp no tenga permiso de contactos."
+                  val uri = Uri.parse("content://com.android.contacts/data/" + row.second)
+                  var r = launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime).setPackage("com.whatsapp"), "ok")
+                  if (r != "ok") r = launch(Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime), "ok")
+                  if (r != "ok") return "No pude iniciar la llamada de WhatsApp."
+                  return (if (video) "Videollamada" else "Llamada") + " de WhatsApp iniciada a " + row.first + "."
               }
 
               fun contactName(num: String): String? {
@@ -618,6 +707,8 @@ jobs:
 
               fun webOn(c: Context): Boolean = prefs(c).getBoolean("web", true)
 
+              fun confirmOn(c: Context): Boolean = prefs(c).getBoolean("confirm", true)
+
               fun provider(c: Context): String = prefs(c).getString("provider", "gemini") ?: "gemini"
 
               fun name(id: String): String = names[ids.indexOf(id).coerceAtLeast(0)]
@@ -657,16 +748,24 @@ jobs:
                   "como un mayordomo digital. Tus respuestas se leen en voz alta: sé breve (1 a 3 frases), " +
                   "sin markdown, sin asteriscos, sin listas ni emojis."
 
+              private val agent = " Eres autónomo: tienes herramientas para controlar el teléfono (abrir apps, llamar, " +
+                  "WhatsApp, tocar, escribir, leer pantalla). Cuando el señor pida una acción, EJECÚTALA con las herramientas " +
+                  "en lugar de explicar cómo hacerla. Para mensajes por WhatsApp usa whatsapp_message; para llamadas por " +
+                  "WhatsApp usa whatsapp_call; para llamadas normales call_contact. Para tareas de varios pasos en una app " +
+                  "encadena herramientas: open_app, wait, read_screen para ver qué hay, tap_text, type_text, etc., y verifica " +
+                  "con read_screen antes de decir que terminaste. Nunca afirmes que hiciste algo si la herramienta devolvió un " +
+                  "fallo: cuéntaselo al señor tal cual. Al terminar responde en una frase breve."
+
               private fun system(): String {
                   val facts = Store.facts(ctx)
                   val extra = if (facts.isEmpty()) "" else " Datos que recuerdas sobre el señor: " + facts.joinToString("; ") + "."
                   val now = SimpleDateFormat("EEEE d 'de' MMMM 'de' yyyy, HH:mm", Locale("es")).format(Date())
                   val web = if (Cfg.webOn(ctx))
-                      " Tienes acceso a internet mediante búsqueda. Úsala siempre que el señor diga busca o investiga, y para " +
-                          "noticias, clima, precios, deportes, datos recientes o cualquier cosa de la que no estés seguro. " +
-                          "Resume lo encontrado en 1 a 3 frases."
+                      " Tienes acceso a internet con la herramienta web_search. Úsala siempre que el señor diga busca o " +
+                          "investiga, y para noticias, clima, precios, deportes, datos recientes o cualquier cosa de la que " +
+                          "no estés seguro. Resume lo encontrado en 1 a 3 frases."
                   else ""
-                  return base + " Fecha y hora actuales: " + now + "." + web + extra
+                  return base + agent + " Fecha y hora actuales: " + now + "." + web + extra
               }
 
               private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
@@ -694,13 +793,14 @@ jobs:
                   return "Señor, error " + code + (if (d.isNotEmpty()) ": " + d else "") + "."
               }
 
-              private fun searchTool(): JSONArray {
-                  val props = JSONObject().put("query", JSONObject().put("type", "string").put("description", "texto a buscar en internet"))
-                  val params = JSONObject().put("type", "object").put("properties", props).put("required", JSONArray().put("query"))
-                  val fn = JSONObject().put("name", "web_search")
-                      .put("description", "Busca información actual en internet: noticias, clima, precios, deportes, datos recientes.")
-                      .put("parameters", params)
-                  return JSONArray().put(JSONObject().put("type", "function").put("function", fn))
+              /** Ejecuta una herramienta. Si pide confirmación devuelve la pregunta con prefijo \u0001. */
+              private fun runTool(name: String, args: JSONObject, actions: Actions): String {
+                  if (Tools.needsConfirm(name) && Cfg.confirmOn(ctx)) {
+                      Tools.setPending(name, args)
+                      return "\u0001" + Tools.question(name, args)
+                  }
+                  Bus.emit("thinking", if (name == "web_search") "Buscando en internet…" else "Ejecutando…")
+                  return Tools.run(ctx, actions, name, args)
               }
 
               fun ask(user: String, att: Attachment? = null): String {
@@ -718,9 +818,11 @@ jobs:
                   val prompt = if (fileText != null) "Contenido del archivo \"" + attName + "\":\n" + fileText + "\n\n" + user else user
                   val sys = system()
                   val web = Cfg.webOn(ctx)
+                  val actions = Actions(ctx)
 
                   try {
                       var ans = ""
+                      var rounds = 0
                       if (prov == "gemini") {
                           val contents = JSONArray()
                           for ((r, t) in hist) {
@@ -733,24 +835,44 @@ jobs:
                           }
                           contents.put(JSONObject().put("role", "user").put("parts", parts))
                           val url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
-
-                          fun call(withSearch: Boolean): Pair<Int, String> {
+                          var tools = true
+                          Bus.emit("thinking", "Pensando…")
+                          while (true) {
                               val body = JSONObject()
                                   .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
                                   .put("contents", contents)
-                              if (withSearch) body.put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
-                              return post(url, mapOf("x-goog-api-key" to key), body)
+                              if (tools) body.put("tools", Tools.gemini(web))
+                              val res = post(url, mapOf("x-goog-api-key" to key), body)
+                              if (res.first !in 200..299) {
+                                  if (tools && rounds == 0 && res.first in 400..404) { tools = false; continue }
+                                  return errMsg(res.first, res.second)
+                              }
+                              val cand = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
+                              val content = cand.optJSONObject("content") ?: return "Señor, no obtuve respuesta."
+                              val rp = content.optJSONArray("parts") ?: JSONArray()
+                              val calls = ArrayList<JSONObject>()
+                              val sb = StringBuilder()
+                              for (i in 0 until rp.length()) {
+                                  val pt = rp.getJSONObject(i)
+                                  val fc = pt.optJSONObject("functionCall")
+                                  if (fc != null) calls.add(fc) else sb.append(pt.optString("text", ""))
+                              }
+                              if (!tools || calls.isEmpty() || rounds >= 7) { ans = sb.toString(); break }
+                              content.put("role", "model")
+                              contents.put(content)
+                              val resp = JSONArray()
+                              var pq: String? = null
+                              for (fc in calls) {
+                                  val nm = fc.optString("name")
+                                  val r = runTool(nm, fc.optJSONObject("args") ?: JSONObject(), actions)
+                                  if (r.startsWith("\u0001")) { pq = r.substring(1); break }
+                                  resp.put(JSONObject().put("functionResponse",
+                                      JSONObject().put("name", nm).put("response", JSONObject().put("result", r))))
+                              }
+                              if (pq != null) { ans = pq; break }
+                              contents.put(JSONObject().put("role", "user").put("parts", resp))
+                              rounds++
                           }
-
-                          if (web) Bus.emit("thinking", "Pensando…")
-                          var res = call(web)
-                          if (web && res.first in 400..404) res = call(false)
-                          if (res.first !in 200..299) return errMsg(res.first, res.second)
-                          val rp = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
-                              .getJSONObject("content").getJSONArray("parts")
-                          val sb = StringBuilder()
-                          for (i in 0 until rp.length()) sb.append(rp.getJSONObject(i).optString("text", ""))
-                          ans = sb.toString()
                       } else {
                           val baseUrl = Cfg.base(ctx, prov)
                           if (baseUrl.isEmpty()) return "Señor, falta la dirección del servicio en Ajustes."
@@ -768,43 +890,45 @@ jobs:
                               msgs.put(JSONObject().put("role", "user").put("content", prompt))
                           }
                           val headers = mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus")
-                          var useTools = web && b64 == null
-                          var finished = false
-                          var round = 0
-                          while (!finished && round < 4) {
+                          var tools = true
+                          Bus.emit("thinking", "Pensando…")
+                          while (true) {
                               val body = JSONObject().put("model", model).put("messages", msgs)
-                              val tools = useTools && round < 3
-                              if (tools) body.put("tools", searchTool())
+                              if (tools) body.put("tools", Tools.openai(web))
                               val res = post(baseUrl + "/chat/completions", headers, body)
                               if (res.first !in 200..299) {
-                                  if (tools && res.first in 400..404) { useTools = false; continue }
+                                  if (tools && rounds == 0 && res.first in 400..404) { tools = false; continue }
                                   return errMsg(res.first, res.second)
                               }
                               val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
                               val calls = msg.optJSONArray("tool_calls")
-                              if (tools && calls != null && calls.length() > 0) {
+                              if (tools && calls != null && calls.length() > 0 && rounds < 7) {
                                   msgs.put(msg)
+                                  var pq: String? = null
                                   for (k in 0 until calls.length()) {
                                       val call = calls.getJSONObject(k)
+                                      val fn = call.getJSONObject("function")
                                       val args = try {
-                                          JSONObject(call.getJSONObject("function").optString("arguments", "{}"))
+                                          JSONObject(fn.optString("arguments", "{}"))
                                       } catch (e: Exception) {
                                           JSONObject()
                                       }
-                                      val q = args.optString("query", user)
-                                      Bus.emit("thinking", "Buscando en internet…")
+                                      val r = runTool(fn.optString("name"), args, actions)
+                                      if (r.startsWith("\u0001")) { pq = r.substring(1); break }
                                       msgs.put(JSONObject().put("role", "tool")
                                           .put("tool_call_id", call.optString("id"))
-                                          .put("content", Search.web(q)))
+                                          .put("content", r))
                                   }
-                                  round++
+                                  if (pq != null) { ans = pq; break }
+                                  rounds++
                                   continue
                               }
                               ans = if (msg.isNull("content")) "" else msg.getString("content")
-                              finished = true
+                              break
                           }
                       }
                       ans = ans.replace("*", "").trim()
+                      if (ans.isEmpty() && rounds > 0) ans = "Hecho, señor."
                       if (ans.isEmpty()) return "Señor, no obtuve respuesta."
                       Store.append(ctx, "user", if (att != null) "[adjunto: " + att.name + "] " + user else user)
                       Store.append(ctx, "assistant", ans)
@@ -2204,6 +2328,14 @@ jobs:
                   webSw.setOnCheckedChangeListener { _, on -> Cfg.prefs(this).edit().putBoolean("web", on).apply() }
                   col.addView(webSw)
 
+                  val confSw = Switch(this)
+                  confSw.text = "Pedir confirmación antes de llamar o enviar mensajes"
+                  confSw.setTextColor(0xFFE8F6FF.toInt())
+                  confSw.isChecked = Cfg.confirmOn(this)
+                  confSw.setPadding(0, dp(14), 0, dp(4))
+                  confSw.setOnCheckedChangeListener { _, on -> Cfg.prefs(this).edit().putBoolean("confirm", on).apply() }
+                  col.addView(confSw)
+
                   col.addView(styled("Probar conexión") {
                       saveFields(cur)
                       testOut.text = "Probando…"
@@ -2255,6 +2387,8 @@ jobs:
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   })
 
+                  col.addView(styled("Revisar estado (por qué no funciona algo)") { testOut.text = statusReport() })
+
                   val sv = ScrollView(this)
                   sv.setBackgroundColor(0xFF050A14.toInt())
                   sv.addView(col)
@@ -2288,6 +2422,42 @@ jobs:
                       else -> "Cualquier servicio compatible con OpenAI: escriba su dirección base, clave y modelo."
                   }
                   testOut.text = ""
+              }
+
+              private fun statusReport(): String {
+                  fun ok(b: Boolean) = if (b) "✔ " else "✘ "
+                  fun g(p: String) = checkSelfPermission(p) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                  val sb = StringBuilder()
+                  sb.append(ok(g(Manifest.permission.RECORD_AUDIO))).append("Micrófono\n")
+                  sb.append(ok(g(Manifest.permission.READ_CONTACTS))).append("Contactos\n")
+                  sb.append(ok(g(Manifest.permission.CALL_PHONE))).append("Llamadas\n")
+                  sb.append(ok(g(Manifest.permission.ANSWER_PHONE_CALLS))).append("Contestar/colgar\n")
+                  sb.append(ok(Settings.canDrawOverlays(this))).append("Abrir apps en segundo plano (botón 2)\n")
+                  sb.append(ok(CerberusAccess.inst != null)).append("Accesibilidad activa (botón 4)\n")
+                  var wa = false
+                  try {
+                      packageManager.getPackageInfo("com.whatsapp", 0)
+                      wa = true
+                  } catch (e: Exception) {
+                      try {
+                          packageManager.getPackageInfo("com.whatsapp.w4b", 0)
+                          wa = true
+                      } catch (e2: Exception) {
+                      }
+                  }
+                  sb.append(ok(wa)).append("WhatsApp instalado\n")
+                  var n = 0
+                  try {
+                      contentResolver.query(
+                          android.provider.ContactsContract.Data.CONTENT_URI, arrayOf(android.provider.ContactsContract.Data._ID),
+                          android.provider.ContactsContract.Data.MIMETYPE + "=?",
+                          arrayOf("vnd.android.cursor.item/vnd.com.whatsapp.voip.call"), null
+                      )?.use { n = it.count }
+                  } catch (e: Exception) {
+                  }
+                  sb.append(ok(n > 0)).append("Contactos con WhatsApp sincronizados: ").append(n)
+                  if (n == 0) sb.append(" (WhatsApp debe tener permiso de contactos para poder llamar)")
+                  return sb.toString()
               }
 
               private fun saveFields(id: String) {
@@ -2467,6 +2637,169 @@ jobs:
                   }
                   write(c, "facts.json", keep)
                   return removed
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Tools.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.os.Build
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /** Herramientas que la IA puede llamar para actuar sobre el teléfono (modo autónomo). */
+          object Tools {
+
+              class Def(val name: String, val desc: String, val params: List<Array<String>>)
+
+              private fun p(n: String, t: String, d: String, req: Boolean = true) =
+                  arrayOf(n, t, d, if (req) "1" else "0")
+
+              private val webDef = Def(
+                  "web_search",
+                  "Busca información actual en internet: noticias, clima, precios, deportes, datos recientes.",
+                  listOf(p("query", "string", "texto a buscar"))
+              )
+
+              val defs: List<Def> = listOf(
+                  Def("open_app", "Abre una aplicación instalada por su nombre.", listOf(p("name", "string", "nombre de la app"))),
+                  Def("call_contact", "Llama por teléfono normal a un contacto de la agenda.", listOf(p("contact", "string", "nombre del contacto"))),
+                  Def(
+                      "whatsapp_message", "Envía un mensaje de WhatsApp a un contacto de la agenda.",
+                      listOf(p("contact", "string", "nombre del contacto"), p("message", "string", "texto del mensaje"))
+                  ),
+                  Def(
+                      "whatsapp_call", "Hace una llamada de WhatsApp (voz o video) a un contacto de la agenda.",
+                      listOf(p("contact", "string", "nombre del contacto"), p("video", "boolean", "true si es videollamada", false))
+                  ),
+                  Def("answer_call", "Contesta la llamada entrante.", emptyList()),
+                  Def("hang_up", "Cuelga o rechaza la llamada.", emptyList()),
+                  Def("torch", "Enciende o apaga la linterna.", listOf(p("on", "boolean", "true enciende, false apaga"))),
+                  Def("volume", "Sube o baja el volumen.", listOf(p("direction", "string", "up o down"))),
+                  Def("remember", "Guarda un dato sobre el señor en la memoria permanente.", listOf(p("fact", "string", "dato a recordar"))),
+                  Def("tap_text", "Toca en pantalla el elemento que contenga ese texto (requiere accesibilidad).", listOf(p("text", "string", "texto visible del botón o elemento"))),
+                  Def("type_text", "Escribe texto en el campo activo (requiere accesibilidad).", listOf(p("text", "string", "texto a escribir"))),
+                  Def("scroll", "Desplaza la pantalla.", listOf(p("direction", "string", "up o down"))),
+                  Def("press", "Botón del sistema: home, back, recents, notifications o screenshot.", listOf(p("button", "string", "home, back, recents, notifications, screenshot"))),
+                  Def("read_screen", "Lee los textos visibles en la pantalla actual para ver qué hay.", emptyList()),
+                  Def("wait", "Espera unos segundos a que cargue una pantalla.", listOf(p("seconds", "number", "segundos, de 1 a 6")))
+              )
+
+              private fun schema(d: Def, forGemini: Boolean): JSONObject? {
+                  if (d.params.isEmpty()) return if (forGemini) null else JSONObject().put("type", "object").put("properties", JSONObject())
+                  val props = JSONObject()
+                  val req = JSONArray()
+                  for (a in d.params) {
+                      props.put(a[0], JSONObject().put("type", a[1]).put("description", a[2]))
+                      if (a[3] == "1") req.put(a[0])
+                  }
+                  return JSONObject().put("type", "object").put("properties", props).put("required", req)
+              }
+
+              private fun all(web: Boolean): List<Def> = if (web) defs + webDef else defs
+
+              fun openai(web: Boolean): JSONArray {
+                  val out = JSONArray()
+                  for (d in all(web)) {
+                      val fn = JSONObject().put("name", d.name).put("description", d.desc)
+                      schema(d, false)?.let { fn.put("parameters", it) }
+                      out.put(JSONObject().put("type", "function").put("function", fn))
+                  }
+                  return out
+              }
+
+              fun gemini(web: Boolean): JSONArray {
+                  val decl = JSONArray()
+                  for (d in all(web)) {
+                      val fn = JSONObject().put("name", d.name).put("description", d.desc)
+                      schema(d, true)?.let { fn.put("parameters", it) }
+                      decl.put(fn)
+                  }
+                  return JSONArray().put(JSONObject().put("functionDeclarations", decl))
+              }
+
+              // ---- confirmación antes de acciones que afectan a terceros ----
+              @Volatile private var pending: Pair<String, JSONObject>? = null
+              @Volatile private var pendingAt = 0L
+
+              fun needsConfirm(n: String) = n == "whatsapp_message" || n == "call_contact" || n == "whatsapp_call"
+
+              fun question(n: String, a: JSONObject): String = when (n) {
+                  "whatsapp_message" -> "Señor, ¿confirma que envíe a " + a.optString("contact") + " por WhatsApp: " + a.optString("message") + "?"
+                  "call_contact" -> "Señor, ¿confirma que llame a " + a.optString("contact") + "?"
+                  else -> "Señor, ¿confirma que llame por WhatsApp a " + a.optString("contact") + "?"
+              }
+
+              fun setPending(n: String, a: JSONObject) {
+                  pending = Pair(n, a)
+                  pendingAt = System.currentTimeMillis()
+              }
+
+              fun takePending(): Pair<String, JSONObject>? {
+                  val p = pending
+                  pending = null
+                  return if (p != null && System.currentTimeMillis() - pendingAt < 120000L) p else null
+              }
+
+              fun run(ctx: Context, a: Actions, name: String, args: JSONObject): String {
+                  fun acc(block: (CerberusAccess) -> String): String =
+                      CerberusAccess.inst?.let(block)
+                          ?: "La accesibilidad no está activada. Dígale al señor que la active en Ajustes, botón 4."
+                  return try {
+                      when (name) {
+                          "open_app" -> {
+                              val r = a.openApp(args.optString("name"))
+                              Thread.sleep(1500)
+                              r
+                          }
+                          "call_contact" -> a.call(args.optString("contact"))
+                          "whatsapp_message" -> a.whatsappSend(args.optString("contact"), args.optString("message"))
+                          "whatsapp_call" -> a.whatsappCall(args.optString("contact"), args.optBoolean("video", false))
+                          "answer_call" -> a.answer()
+                          "hang_up" -> a.hangup()
+                          "torch" -> a.torch(args.optBoolean("on", true))
+                          "volume" -> a.volume(args.optString("direction") != "down")
+                          "remember" -> {
+                              Store.addFact(ctx, args.optString("fact"))
+                              "Anotado."
+                          }
+                          "tap_text" -> acc { if (it.clickText(args.optString("text"))) "Pulsado." else "No encontré ese texto en la pantalla." }
+                          "type_text" -> acc { if (it.typeText(args.optString("text"))) "Escrito." else "No hay un campo de texto activo." }
+                          "scroll" -> acc {
+                              it.scroll(args.optString("direction") != "up")
+                              "Hecho."
+                          }
+                          "press" -> acc {
+                              val g = when (args.optString("button")) {
+                                  "home" -> AccessibilityService.GLOBAL_ACTION_HOME
+                                  "back" -> AccessibilityService.GLOBAL_ACTION_BACK
+                                  "recents" -> AccessibilityService.GLOBAL_ACTION_RECENTS
+                                  "notifications" -> AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS
+                                  "screenshot" -> if (Build.VERSION.SDK_INT >= 28) AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT else -1
+                                  else -> -1
+                              }
+                              if (g < 0) {
+                                  "Botón desconocido."
+                              } else {
+                                  it.global(g)
+                                  "Hecho."
+                              }
+                          }
+                          "read_screen" -> acc { it.readScreen() }
+                          "wait" -> {
+                              val s = args.optDouble("seconds", 1.0)
+                              Thread.sleep((s.coerceIn(0.5, 6.0) * 1000).toLong())
+                              "Listo."
+                          }
+                          "web_search" -> Search.web(args.optString("query"))
+                          else -> "Herramienta desconocida."
+                      }
+                  } catch (e: Exception) {
+                      "Error: " + (e.message ?: "falló")
+                  }
               }
           }
           CERBEOF
