@@ -152,6 +152,8 @@ jobs:
               android:accessibilityFeedbackType="feedbackGeneric"
               android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
               android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
               android:notificationTimeout="100"
               android:description="@string/acc_desc" />
           CERBEOF
@@ -196,6 +198,7 @@ jobs:
           import android.telephony.PhoneNumberUtils
           import android.telephony.TelephonyManager
           import android.telecom.TelecomManager
+          import org.json.JSONObject
           import java.net.URLEncoder
           import java.text.Normalizer
           import java.text.SimpleDateFormat
@@ -227,8 +230,8 @@ jobs:
                       if (Regex("^(no|cancela|cancelar|negativo|detente|para|nada)( |$)").containsMatchIn(t))
                           return "Cancelado, señor."
                   }
-                  // Todo lo que mencione WhatsApp lo resuelve la IA con sus herramientas (entiende acentos y frases libres).
-                  if (t.contains("whatsapp") || t.contains("wasap") || t.contains("guasap")) return null
+                  // WhatsApp: primero un intérprete propio (rápido y sin depender de la IA); si no entiende la frase, lo resuelve la IA.
+                  if (t.contains("whatsapp") || t.contains("wasap") || t.contains("guasap")) return whatsappLocal(raw.trim(), t)
 
                   Regex("^(recuerda|anota|memoriza|guarda en tu memoria)( que)? (.+)$", RegexOption.IGNORE_CASE)
                       .find(raw.trim())?.let {
@@ -338,6 +341,32 @@ jobs:
                       return openApp(name)
                   }
 
+                  return null
+              }
+
+              private fun viaTool(name: String, args: JSONObject): String {
+                  if (Tools.needsConfirm(name) && Cfg.confirmOn(ctx)) {
+                      Tools.setPending(name, args)
+                      return Tools.question(name, args)
+                  }
+                  return Tools.run(ctx, this, name, args)
+              }
+
+              private fun whatsappLocal(raw: String, t: String): String? {
+                  val o = RegexOption.IGNORE_CASE
+                  val waWord = "(?:whatsapp|wasap|guasap)"
+                  Regex("^(?:m[aá]nd[ae](?:le)?|env[ií][ae](?:le)?|escr[ií]be(?:le)?)\\s+(?:un\\s+|el\\s+)?(?:whatsapp|wasap|guasap|mensaje(?:\\s+de\\s+" + waWord + ")?)?(?:\\s+por\\s+" + waWord + ")?\\s*(?:a|para)\\s+(.+?)\\s+(?:por\\s+" + waWord + "\\s+)?(?:diciendo(?:le)?|que\\s+diga|que\\s+dice|con\\s+el\\s+mensaje|y\\s+d[ií]le\\s+que|y\\s+d[ií]le|d[ií]le\\s+que|d[ií]le|que)\\s+(.+)$", o)
+                      .find(raw)?.let {
+                          return viaTool("whatsapp_message", JSONObject().put("contact", it.groupValues[1].trim()).put("message", it.groupValues[2].trim()))
+                      }
+                  if (Regex("^(llama|llamar|llamada|videollamada|video llamada|marca|haz una|hazme una|realiza una|quiero hacer una)").containsMatchIn(t) &&
+                      !Regex("mensaje|diciendo|dile").containsMatchIn(t)
+                  ) {
+                      var name = raw.replace(Regex("^(?:haz(?:me)?\\s+una\\s+|realiza\\s+una\\s+|quiero\\s+hacer\\s+una\\s+)?(?:video\\s?llamada|llamada|llamar|llama|marca)\\s*(?:de\\s+" + waWord + "\\s+|por\\s+" + waWord + "\\s+|de\\s+video\\s+|por\\s+video\\s+)*(?:a\\s+la\\s+|a\\s+|al\\s+)?", o), "")
+                      name = name.replace(Regex("\\s+(?:por|en|de|con|mediante|a\\s+trav[eé]s\\s+de)\\s+" + waWord + ".*$", o), "").trim(' ', '.', ',')
+                      if (name.isNotEmpty())
+                          return viaTool("whatsapp_call", JSONObject().put("contact", name).put("video", t.contains("video")))
+                  }
                   return null
               }
 
@@ -527,7 +556,7 @@ jobs:
                       Thread.sleep(500)
                       if (acc.clickId("com.whatsapp:id/send") || acc.clickId("com.whatsapp.w4b:id/send"))
                           return "Mensaje enviado a $cname."
-                      if (n >= 6 && acc.clickText("enviar")) return "Mensaje enviado a $cname."
+                      if (n >= 3 && acc.clickDesc(listOf("enviar", "send"), "bottom")) return "Mensaje enviado a $cname."
                   }
                   return "Dejé el mensaje preparado para $cname, pero no logré pulsar enviar."
               }
@@ -555,8 +584,8 @@ jobs:
                   if (digits.isEmpty()) return label + " no arrancó y no pude abrir el chat de " + row.first + "."
                   launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/" + digits)).setPackage("com.whatsapp"), "ok")
                   Thread.sleep(3000)
-                  val tapped = if (video) (acc.clickText("videollamada") || acc.clickText("video call"))
-                  else (acc.clickText("llamada de voz") || acc.clickText("voice call"))
+                  val tapped = if (video) acc.clickDesc(listOf("videollamada", "video call", "video"), "top")
+                  else acc.clickDesc(listOf("llamada de voz", "voice call", "llamar", "llamada"), "top", "video")
                   if (!tapped) return label + " no arrancó y no encontré el botón de llamada en el chat."
                   Thread.sleep(1500)
                   acc.clickText("llamar")
@@ -773,8 +802,11 @@ jobs:
                   "en lugar de explicar cómo hacerla. Para mensajes por WhatsApp usa whatsapp_message; para llamadas por " +
                   "WhatsApp usa whatsapp_call; para llamadas normales call_contact. Para tareas de varios pasos en una app " +
                   "encadena herramientas: open_app, wait, read_screen para ver qué hay, tap_text, type_text, etc., y verifica " +
-                  "con read_screen antes de decir que terminaste. Nunca afirmes que hiciste algo si la herramienta devolvió un " +
+                  "con read_screen antes de decir que terminaste. read_screen te muestra botones con sus coordenadas: si el botón que buscas no tiene nombre o tap_text falla, usa tap_xy con esas coordenadas. Si read_screen no muestra lo que necesitas (pantalla vacía, juego, imágenes), usa look_screen para verla como imagen y luego tap_xy con percent=true. Nunca afirmes que hiciste algo si la herramienta devolvió un " +
                   "fallo: cuéntaselo al señor tal cual. Al terminar responde en una frase breve."
+
+              private val noTools = " AVISO: en este momento NO tienes herramientas para controlar el teléfono (el modelo o el servicio las rechazó). " +
+                  "Si el señor pide una acción (llamar, enviar mensajes, abrir apps, tocar), NO digas que la hiciste: dile que su modelo actual no admite herramientas y que cambie a Gemini en Ajustes."
 
               private fun system(): String {
                   val facts = Store.facts(ctx)
@@ -823,6 +855,44 @@ jobs:
                   return Tools.run(ctx, actions, name, args)
               }
 
+              /** Mira una imagen (captura de pantalla) con el proveedor actual y la describe en texto. */
+              fun vision(b64: String, question: String): String {
+                  val prov = Cfg.provider(ctx)
+                  val key = Cfg.key(ctx, prov)
+                  val model = Cfg.model(ctx, prov)
+                  if (key.isEmpty() || model.isEmpty()) return "Falta configurar el proveedor de IA."
+                  val q = question + " Responde en español, breve. Para cada botón o icono relevante da su posición como porcentaje " +
+                      "del ancho y del alto de la imagen, con el formato nombre(x%,y%)."
+                  return try {
+                      if (prov == "gemini") {
+                          val parts = JSONArray().put(JSONObject().put("text", q))
+                              .put(JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", b64)))
+                          val body = JSONObject().put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", parts)))
+                          val res = post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+                              mapOf("x-goog-api-key" to key), body)
+                          if (res.first !in 200..299) return errMsg(res.first, res.second)
+                          val rp = JSONObject(res.second).getJSONArray("candidates").getJSONObject(0)
+                              .getJSONObject("content").getJSONArray("parts")
+                          val sb = StringBuilder()
+                          for (i in 0 until rp.length()) sb.append(rp.getJSONObject(i).optString("text", ""))
+                          sb.toString().trim()
+                      } else {
+                          val baseUrl = Cfg.base(ctx, prov)
+                          val content = JSONArray().put(JSONObject().put("type", "text").put("text", q))
+                              .put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:image/jpeg;base64," + b64)))
+                          val body = JSONObject().put("model", model)
+                              .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
+                          val res = post(baseUrl + "/chat/completions",
+                              mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus"), body)
+                          if (res.first !in 200..299) return errMsg(res.first, res.second)
+                          val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+                          (if (msg.isNull("content")) "" else msg.getString("content")).trim()
+                      }
+                  } catch (e: Exception) {
+                      "No pude analizar la captura."
+                  }
+              }
+
               fun ask(user: String, att: Attachment? = null): String {
                   val prov = Cfg.provider(ctx)
                   val key = Cfg.key(ctx, prov)
@@ -859,7 +929,7 @@ jobs:
                           Bus.emit("thinking", "Pensando…")
                           while (true) {
                               val body = JSONObject()
-                                  .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+                                  .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", if (tools) sys else sys + noTools))))
                                   .put("contents", contents)
                               if (tools) body.put("tools", Tools.gemini(web))
                               val res = post(url, mapOf("x-goog-api-key" to key), body)
@@ -917,7 +987,11 @@ jobs:
                               if (tools) body.put("tools", Tools.openai(web))
                               val res = post(baseUrl + "/chat/completions", headers, body)
                               if (res.first !in 200..299) {
-                                  if (tools && rounds == 0 && res.first in 400..404) { tools = false; continue }
+                                  if (tools && rounds == 0 && res.first in 400..404) {
+                                      tools = false
+                                      msgs.getJSONObject(0).put("content", sys + noTools)
+                                      continue
+                                  }
                                   return errMsg(res.first, res.second)
                               }
                               val msg = JSONObject(res.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
@@ -964,7 +1038,16 @@ jobs:
           package com.carlosart.cerberus
 
           import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
           import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.Path
+          import android.util.Base64
+          import android.view.Display
+          import java.io.ByteArrayOutputStream
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+          import android.graphics.Rect
           import android.os.Bundle
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
@@ -1013,6 +1096,30 @@ jobs:
                   return (n ?: hit).performAction(AccessibilityNodeInfo.ACTION_CLICK)
               }
 
+              /** Pulsa un icono sin texto por su descripción de accesibilidad. pick: "top" = el más alto, "bottom" = el más bajo y a la derecha. */
+              fun clickDesc(terms: List<String>, pick: String, exclude: String = ""): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val all = ArrayList<AccessibilityNodeInfo>()
+                  walk(root, all)
+                  val nt = terms.map { Actions.norm(it) }
+                  val r = Rect()
+                  var best: AccessibilityNodeInfo? = null
+                  var bestKey = Long.MIN_VALUE
+                  for (n in all) {
+                      if (!n.text.isNullOrEmpty()) continue
+                      val d = Actions.norm((n.contentDescription ?: "").toString())
+                      if (d.isEmpty() || nt.none { d.contains(it) }) continue
+                      if (exclude.isNotEmpty() && d.contains(exclude)) continue
+                      n.getBoundsInScreen(r)
+                      val key = if (pick == "top") -(r.top.toLong() * 10000L) + r.right else r.bottom.toLong() * 10000L + r.right
+                      if (key > bestKey) { bestKey = key; best = n }
+                  }
+                  var n: AccessibilityNodeInfo? = best
+                  while (n != null && !n.isClickable) n = n.parent
+                  val target = n ?: best ?: return false
+                  return target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+              }
+
               fun clickId(id: String): Boolean {
                   val root = rootInActiveWindow ?: return false
                   val l = root.findAccessibilityNodeInfosByViewId(id)
@@ -1048,6 +1155,77 @@ jobs:
                       .distinct()
                   if (texts.isEmpty()) return "No veo texto en la pantalla, señor."
                   return texts.joinToString(". ").take(450)
+              }
+
+              /** Lista de lo que hay en pantalla: etiqueta, si es botón o texto y su centro (x,y), para que la IA decida qué pulsar. */
+              fun describeScreen(): String {
+                  val root = rootInActiveWindow ?: return "No puedo ver la pantalla."
+                  val all = ArrayList<AccessibilityNodeInfo>()
+                  walk(root, all)
+                  val r = Rect()
+                  val dm = resources.displayMetrics
+                  val sb = StringBuilder("Pantalla " + dm.widthPixels + "x" + dm.heightPixels + ". Elementos (etiqueta | tipo | centro x,y):\n")
+                  val seen = HashSet<String>()
+                  var count = 0
+                  for (n in all) {
+                      if (!n.isVisibleToUser) continue
+                      val lab = (n.text ?: n.contentDescription ?: "").toString().trim().replace("\n", " ").take(50)
+                      val click = n.isClickable
+                      if (lab.isEmpty() && !click) continue
+                      n.getBoundsInScreen(r)
+                      if (r.width() <= 0 || r.height() <= 0) continue
+                      val id = n.viewIdResourceName?.substringAfter("/") ?: ""
+                      val name = if (lab.isEmpty()) "(sin nombre" + (if (id.isNotEmpty()) ":" + id else "") + ")" else lab
+                      val line = name + " | " + (if (click) "botón" else "texto") + " | " + r.centerX() + "," + r.centerY()
+                      if (seen.add(line)) {
+                          sb.append(line).append('\n')
+                          count++
+                      }
+                      if (count >= 45) break
+                  }
+                  return sb.toString().take(2200)
+              }
+
+              fun tapXY(x: Float, y: Float): Boolean {
+                  val path = Path()
+                  path.moveTo(x, y)
+                  val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0L, 70L)).build()
+                  return dispatchGesture(g, null, null)
+              }
+
+              /** Captura de pantalla en JPEG base64 (Android 11+). Devuelve null si no se pudo. */
+              fun screenshotB64(): String? {
+                  if (android.os.Build.VERSION.SDK_INT < 30) return null
+                  val latch = CountDownLatch(1)
+                  var bmp: Bitmap? = null
+                  try {
+                      takeScreenshot(Display.DEFAULT_DISPLAY, java.util.concurrent.Executor { it.run() },
+                          object : AccessibilityService.TakeScreenshotCallback {
+                              override fun onSuccess(r: AccessibilityService.ScreenshotResult) {
+                                  try {
+                                      val hb = r.hardwareBuffer
+                                      val b = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)
+                                      bmp = b?.copy(Bitmap.Config.ARGB_8888, false)
+                                      hb.close()
+                                  } catch (e: Exception) {
+                                  }
+                                  latch.countDown()
+                              }
+
+                              override fun onFailure(errorCode: Int) {
+                                  latch.countDown()
+                              }
+                          })
+                  } catch (e: Exception) {
+                      return null
+                  }
+                  latch.await(6, TimeUnit.SECONDS)
+                  val b = bmp ?: return null
+                  val k = 1024f / maxOf(b.width, b.height)
+                  val sc = if (k < 1f) Bitmap.createScaledBitmap(b, (b.width * k).toInt(), (b.height * k).toInt(), true) else b
+                  val out = ByteArrayOutputStream()
+                  sc.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                  return Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
               }
           }
           CERBEOF
@@ -2718,7 +2896,9 @@ jobs:
                   Def("type_text", "Escribe texto en el campo activo (requiere accesibilidad).", listOf(p("text", "string", "texto a escribir"))),
                   Def("scroll", "Desplaza la pantalla.", listOf(p("direction", "string", "up o down"))),
                   Def("press", "Botón del sistema: home, back, recents, notifications o screenshot.", listOf(p("button", "string", "home, back, recents, notifications, screenshot"))),
-                  Def("read_screen", "Lee los textos visibles en la pantalla actual para ver qué hay.", emptyList()),
+                  Def("read_screen", "Ve la pantalla actual: lista cada elemento con su etiqueta, si es botón o texto, y las coordenadas x,y de su centro. Úsala para decidir qué pulsar.", emptyList()),
+                  Def("look_screen", "Toma una captura de la pantalla y la analiza con visión. Úsala si read_screen no basta. Devuelve posiciones en porcentaje.", listOf(p("question", "string", "qué quieres saber de la pantalla"))),
+                  Def("tap_xy", "Toca la pantalla en unas coordenadas x,y (úsala para iconos sin nombre, con las coordenadas que dio read_screen).", listOf(p("x", "number", "coordenada x"), p("y", "number", "coordenada y"), p("percent", "boolean", "true si x e y son porcentajes (0-100) de la pantalla, como da look_screen", false))),
                   Def("wait", "Espera unos segundos a que cargue una pantalla.", listOf(p("seconds", "number", "segundos, de 1 a 6")))
               )
 
@@ -2822,7 +3002,22 @@ jobs:
                                   "Hecho."
                               }
                           }
-                          "read_screen" -> acc { it.readScreen() }
+                          "read_screen" -> acc { it.describeScreen() }
+                          "tap_xy" -> acc {
+                              var x = args.optDouble("x", -1.0).toFloat()
+                              var y = args.optDouble("y", -1.0).toFloat()
+                              if (args.optBoolean("percent", false)) {
+                                  val dm = ctx.resources.displayMetrics
+                                  x = x / 100f * dm.widthPixels
+                                  y = y / 100f * dm.heightPixels
+                              }
+                              if (it.tapXY(x, y)) "Toque realizado." else "No pude tocar ahí."
+                          }
+                          "look_screen" -> acc {
+                              val b = it.screenshotB64()
+                              if (b == null) "No pude capturar la pantalla (requiere Android 11 o superior y reactivar la accesibilidad)."
+                              else Brain(ctx).vision(b, args.optString("question", "Describe la pantalla."))
+                          }
                           "wait" -> {
                               val s = args.optDouble("seconds", 1.0)
                               Thread.sleep((s.coerceIn(0.5, 6.0) * 1000).toLong())
