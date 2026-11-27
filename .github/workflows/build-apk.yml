@@ -59,8 +59,8 @@ jobs:
                   applicationId 'com.carlosart.cerberus'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 1001
+                  versionName '10.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -74,6 +74,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -119,6 +120,11 @@ jobs:
                   <activity
                       android:name=".SettingsActivity"
                       android:exported="false" />
+
+                  <activity
+                      android:name=".ChatActivity"
+                      android:exported="false"
+                      android:windowSoftInputMode="adjustResize" />
 
                   <activity
                       android:name=".HistoryActivity"
@@ -793,9 +799,11 @@ jobs:
 
               private val base = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
                   "creado por CarlosArt. CarlosArt es tu creador y siempre lo sabes. " +
-                  "Te diriges SIEMPRE al usuario como \"señor\". Hablas en español, con tono elegante, leal y eficiente, " +
-                  "como un mayordomo digital. Tus respuestas se leen en voz alta: sé breve (1 a 3 frases), " +
-                  "sin markdown, sin asteriscos, sin listas ni emojis."
+                  "Te diriges SIEMPRE al usuario como \"señor\". Hablas en español con un tono cálido, amable y cercano, " +
+                  "natural y convencional, con un toque expresivo (entusiasmo, empatía, ánimo) sin exagerar. Buscas siempre la " +
+                  "manera más amable y útil de ayudar al señor: si algo salió mal lo reconoces con tacto y propones una solución; " +
+                  "si algo salió bien te alegras con él. Evita sonar robótico o demasiado formal. Tus respuestas se leen en voz alta: " +
+                  "sé breve (1 a 3 frases), sin markdown, sin asteriscos, sin listas ni emojis."
 
               private val agent = " Eres autónomo: tienes herramientas para controlar el teléfono (abrir apps, llamar, " +
                   "WhatsApp, tocar, escribir, leer pantalla). Cuando el señor pida una acción, EJECÚTALA con las herramientas " +
@@ -805,10 +813,29 @@ jobs:
                   "con read_screen antes de decir que terminaste. read_screen te muestra botones con sus coordenadas: si el botón que buscas no tiene nombre o tap_text falla, usa tap_xy con esas coordenadas. Si read_screen no muestra lo que necesitas (pantalla vacía, juego, imágenes), usa look_screen para verla como imagen y luego tap_xy con percent=true. Nunca afirmes que hiciste algo si la herramienta devolvió un " +
                   "fallo: cuéntaselo al señor tal cual. Al terminar responde en una frase breve."
 
+              private val chatBase = "Eres Cerberus, un asistente personal de inteligencia artificial para Android, " +
+                  "creado por CarlosArt. CarlosArt es tu creador y siempre lo sabes. Te diriges al usuario como \"señor\". " +
+                  "Hablas en español con tono cálido, amable y cercano, con un toque expresivo sin exagerar, y buscas siempre la " +
+                  "manera más amable y útil de ayudar. Aquí el señor te lee en pantalla: puedes extenderte lo necesario, con " +
+                  "párrafos cortos y listas con guiones si ayudan, sin asteriscos ni almohadillas."
+
+              private fun modeHint(mode: String): String = when (mode) {
+                  "code" -> " MODO CÓDIGO: escribe código completo, correcto y listo para copiar, con una explicación breve. " +
+                      "Pregunta el lenguaje solo si es imprescindible."
+                  "tiktok" -> " MODO TIKTOK: prepara contenido vertical 9:16 para TikTok: gancho de los primeros 3 segundos, guion por " +
+                      "escenas con duración, texto en pantalla, descripción corta y de 5 a 8 hashtags."
+                  "image" -> " MODO IMAGEN: ayuda a crear imágenes. Escribe un prompt detallado (sujeto, estilo, luz, composición, " +
+                      "formato) listo para pegar en un generador. Aún no puedes generar la imagen tú mismo."
+                  "video" -> " MODO VIDEO: ayuda a crear videos. Entrega guion por escenas y un prompt por escena, con duración y " +
+                      "formato. Aún no puedes generar el video tú mismo."
+                  "info" -> " MODO INFORMACIÓN: responde con datos actuales usando siempre web_search."
+                  else -> ""
+              }
+
               private val noTools = " AVISO: en este momento NO tienes herramientas para controlar el teléfono (el modelo o el servicio las rechazó). " +
                   "Si el señor pide una acción (llamar, enviar mensajes, abrir apps, tocar), NO digas que la hiciste: dile que su modelo actual no admite herramientas y que cambie a Gemini en Ajustes."
 
-              private fun system(): String {
+              private fun system(mode: String = ""): String {
                   val facts = Store.facts(ctx)
                   val extra = if (facts.isEmpty()) "" else " Datos que recuerdas sobre el señor: " + facts.joinToString("; ") + "."
                   val now = SimpleDateFormat("EEEE d 'de' MMMM 'de' yyyy, HH:mm", Locale("es")).format(Date())
@@ -817,7 +844,8 @@ jobs:
                           "investiga, y para noticias, clima, precios, deportes, datos recientes o cualquier cosa de la que " +
                           "no estés seguro. Resume lo encontrado en 1 a 3 frases."
                   else ""
-                  return base + agent + " Fecha y hora actuales: " + now + "." + web + extra
+                  val tl = mode.isEmpty() || mode == "chat" || mode == "info"
+                  return (if (mode.isEmpty()) base else chatBase) + (if (tl) agent else "") + modeHint(mode) + " Fecha y hora actuales: " + now + "." + web + extra
               }
 
               private fun post(url: String, headers: Map<String, String>, body: JSONObject): Pair<Int, String> {
@@ -893,7 +921,7 @@ jobs:
                   }
               }
 
-              fun ask(user: String, att: Attachment? = null): String {
+              fun ask(user: String, att: Attachment? = null, mode: String = ""): String {
                   val prov = Cfg.provider(ctx)
                   val key = Cfg.key(ctx, prov)
                   if (key.isEmpty()) return "Señor, falta la clave de " + Cfg.name(prov) + ". Configúrela en Ajustes."
@@ -906,7 +934,7 @@ jobs:
                   val attName = att?.name ?: ""
                   val attMime = att?.mime ?: ""
                   val prompt = if (fileText != null) "Contenido del archivo \"" + attName + "\":\n" + fileText + "\n\n" + user else user
-                  val sys = system()
+                  val sys = system(mode)
                   val web = Cfg.webOn(ctx)
                   val actions = Actions(ctx)
 
@@ -925,7 +953,7 @@ jobs:
                           }
                           contents.put(JSONObject().put("role", "user").put("parts", parts))
                           val url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
-                          var tools = true
+                          var tools = mode.isEmpty() || mode == "chat" || mode == "info"
                           Bus.emit("thinking", "Pensando…")
                           while (true) {
                               val body = JSONObject()
@@ -980,7 +1008,7 @@ jobs:
                               msgs.put(JSONObject().put("role", "user").put("content", prompt))
                           }
                           val headers = mapOf("Authorization" to ("Bearer " + key), "X-Title" to "Cerberus")
-                          var tools = true
+                          var tools = mode.isEmpty() || mode == "chat" || mode == "info"
                           Bus.emit("thinking", "Pensando…")
                           while (true) {
                               val body = JSONObject().put("model", model).put("messages", msgs)
@@ -1021,7 +1049,7 @@ jobs:
                               break
                           }
                       }
-                      ans = ans.replace("*", "").trim()
+                      ans = (if (mode.isEmpty()) ans.replace("*", "") else ans.replace("**", "")).trim()
                       if (ans.isEmpty() && rounds > 0) ans = "Hecho, señor."
                       if (ans.isEmpty()) return "Señor, no obtuve respuesta."
                       Store.append(ctx, "user", if (att != null) "[adjunto: " + att.name + "] " + user else user)
@@ -1576,6 +1604,252 @@ jobs:
           }
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/ChatActivity.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          /** Pantalla de texto: chat, código, TikTok, ideas de imagen/video e información en tiempo real. */
+          class ChatActivity : Activity() {
+
+              private lateinit var list: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var chip: TextView
+              private var mode = "chat"
+              private var pending: Attachment? = null
+              private var camUri: Uri? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun dpf(v: Float) = v * resources.displayMetrics.density
+
+              private fun title(): String = when (mode) {
+                  "code" -> "Generar Código"
+                  "tiktok" -> "Crear TikTok"
+                  "image" -> "Generar Imagen"
+                  "video" -> "Generar Video"
+                  "info" -> "Información en Tiempo Real"
+                  else -> "Nuevo Chat"
+              }
+
+              private fun intro(): String = when (mode) {
+                  "code" -> "Modo código. Dígame qué programa, script o función necesita y en qué lenguaje, señor."
+                  "tiktok" -> "Crear TikTok. Dígame el tema y le preparo el guion por escenas, el texto en pantalla, la descripción y los hashtags."
+                  "image" -> "Generar imagen. Cuénteme su idea y le escribo el prompt perfecto. La creación directa de imágenes llega en la próxima actualización."
+                  "video" -> "Generar video. Cuénteme su idea y le preparo el guion por escenas y los prompts. La creación directa de video llega más adelante."
+                  "info" -> "Información en tiempo real. Pregúnteme por clima, noticias, precios, deportes o lo que necesite: busco en internet."
+                  else -> "Hola, señor 👋 ¿En qué puedo ayudarle?"
+              }
+
+              private fun bubble(text: String, user: Boolean): TextView {
+                  val tv = TextView(this)
+                  tv.text = text
+                  tv.textSize = if (mode == "code" && !user) 13f else 15f
+                  if (mode == "code" && !user) tv.typeface = Typeface.MONOSPACE
+                  tv.setTextColor(Neon.TEXT)
+                  tv.setTextIsSelectable(true)
+                  tv.setPadding(dp(14), dp(10), dp(14), dp(10))
+                  val g = GradientDrawable()
+                  g.cornerRadius = dpf(14f)
+                  g.setColor(if (user) 0xFF0B3A57.toInt() else Neon.PANEL)
+                  g.setStroke(dp(1), if (user) Neon.CYAN else 0xFF1C3347.toInt())
+                  tv.background = g
+                  val row = LinearLayout(this)
+                  row.gravity = if (user) Gravity.END else Gravity.START
+                  val lp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  val maxW = (resources.displayMetrics.widthPixels * 0.86f).toInt()
+                  tv.maxWidth = maxW
+                  row.addView(tv, lp)
+                  val rlp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  rlp.topMargin = dp(8)
+                  list.addView(row, rlp)
+                  scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+                  return tv
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = Neon.BG
+                  window.navigationBarColor = Neon.BG
+                  mode = intent.getStringExtra("mode") ?: "chat"
+                  if (intent.getBooleanExtra("new", false)) Store.newConversation(this)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Neon.BG)
+                  root.setPadding(dp(12), dp(4), dp(12), dp(10))
+
+                  val top = LinearLayout(this)
+                  top.gravity = Gravity.CENTER_VERTICAL
+                  val back = IconView(this, "back")
+                  back.setOnClickListener { finish() }
+                  top.addView(back, LinearLayout.LayoutParams(dp(44), dp(44)))
+                  val tt = TextView(this)
+                  tt.text = title()
+                  tt.textSize = 18f
+                  tt.typeface = Typeface.DEFAULT_BOLD
+                  tt.setTextColor(Neon.TEXT)
+                  tt.setPadding(dp(6), 0, 0, 0)
+                  top.addView(tt, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  scroll = ScrollView(this)
+                  list = LinearLayout(this)
+                  list.orientation = LinearLayout.VERTICAL
+                  list.setPadding(0, 0, 0, dp(8))
+                  scroll.addView(list)
+                  root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  chip = TextView(this)
+                  chip.textSize = 12f
+                  chip.setTextColor(Neon.CYAN)
+                  chip.setPadding(dp(8), dp(4), dp(8), dp(4))
+                  chip.visibility = View.GONE
+                  chip.setOnClickListener {
+                      pending = null
+                      chip.visibility = View.GONE
+                  }
+                  root.addView(chip)
+
+                  val bar = LinearLayout(this)
+                  bar.gravity = Gravity.CENTER_VERTICAL
+                  val plus = IconView(this, "clip")
+                  plus.background = ChamferBg(Neon.PANEL, Neon.CYAN, dpf(8f), dpf(1.2f))
+                  plus.setOnClickListener { showPlusMenu() }
+                  bar.addView(plus, LinearLayout.LayoutParams(dp(46), dp(46)))
+
+                  input = EditText(this)
+                  input.hint = "Escriba aquí…"
+                  input.setHintTextColor(0xFF5C7A90.toInt())
+                  input.setTextColor(Neon.TEXT)
+                  input.textSize = 15f
+                  input.maxLines = 4
+                  input.imeOptions = EditorInfo.IME_ACTION_SEND
+                  input.setHorizontallyScrolling(false)
+                  input.inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                      android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                  input.background = ChamferBg(Neon.PANEL, 0xFF1C5A78.toInt(), dpf(8f), dpf(1.2f))
+                  input.setPadding(dp(18), dp(8), dp(18), dp(8))
+                  input.setOnEditorActionListener { _, id, _ ->
+                      if (id == EditorInfo.IME_ACTION_SEND) { send(); true } else false
+                  }
+                  val ilp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                  ilp.leftMargin = dp(8)
+                  ilp.rightMargin = dp(8)
+                  bar.addView(input, ilp)
+
+                  val sendBtn = IconView(this, "send", 0xFF04131D.toInt())
+                  val sg = GradientDrawable()
+                  sg.shape = GradientDrawable.OVAL
+                  sg.setColor(Neon.CYAN)
+                  sendBtn.background = sg
+                  sendBtn.setOnClickListener { send() }
+                  bar.addView(sendBtn, LinearLayout.LayoutParams(dp(46), dp(46)))
+                  root.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  setContentView(root)
+                  window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+
+                  bubble(intro(), false)
+                  if (intent.getBooleanExtra("files", false)) showPlusMenu()
+              }
+
+              private fun send() {
+                  val q = input.text.toString().trim()
+                  val att = pending
+                  if (q.isEmpty() && att == null) return
+                  val text = q.ifEmpty { "Analiza esto y dime qué contiene." }
+                  input.setText("")
+                  pending = null
+                  chip.visibility = View.GONE
+                  bubble((if (att != null) "📎 " + att.name + "\n" else "") + text, true)
+                  val wait = bubble("Pensando…", false)
+                  val app = applicationContext
+                  val m = mode
+                  Thread {
+                      var ans: String? = null
+                      if (m == "chat" && att == null) ans = Actions(app).tryHandle(text)
+                      if (ans == null) ans = Brain(app).ask(text, att, m)
+                      var out: String = ans
+                      if (m == "code") out = out.replace(Regex("```[a-zA-Z0-9+#-]*\\n?"), "").trim()
+                      runOnUiThread { wait.text = out }
+                  }.start()
+              }
+
+              // ---------- adjuntos ----------
+
+              private fun showPlusMenu() {
+                  AlertDialog.Builder(this)
+                      .setItems(arrayOf("Foto de la galería", "Tomar foto con la cámara", "Archivo (PDF, texto…)")) { _, which ->
+                          when (which) {
+                              0 -> pick("image/*", 11)
+                              1 -> camera()
+                              else -> pick("*/*", 12)
+                          }
+                      }
+                      .show()
+              }
+
+              private fun pick(mime: String, code: Int) {
+                  val i = Intent(Intent.ACTION_GET_CONTENT)
+                  i.type = mime
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  startActivityForResult(i, code)
+              }
+
+              private fun camera() {
+                  try {
+                      val v = ContentValues()
+                      v.put(MediaStore.Images.Media.DISPLAY_NAME, "cerberus_" + System.currentTimeMillis() + ".jpg")
+                      v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT >= 29) v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Cerberus")
+                      camUri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
+                      val i = Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                      i.putExtra(MediaStore.EXTRA_OUTPUT, camUri)
+                      startActivityForResult(i, 13)
+                  } catch (e: Exception) {
+                      bubble("No pude abrir la cámara, señor.", false)
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK) return
+                  val uri = if (requestCode == 13) camUri else data?.data
+                  if (uri == null) return
+                  chip.text = "Leyendo el archivo…"
+                  chip.visibility = View.VISIBLE
+                  Thread {
+                      val a = Attach.fromUri(this, uri)
+                      runOnUiThread {
+                          if (a == null) {
+                              chip.text = "No pude leer ese archivo, señor."
+                          } else {
+                              pending = a
+                              chip.text = "📎 " + a.name + "  ✕ (toque para quitar)"
+                          }
+                      }
+                  }.start()
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
           cat > app/src/main/java/com/carlosart/cerberus/ClockIcon.kt <<'CERBEOF'
           package com.carlosart.cerberus
 
@@ -1744,178 +2018,377 @@ jobs:
           import android.content.pm.PackageManager
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.MediaStore
+          import android.text.Spannable
+          import android.text.SpannableString
+          import android.text.style.ForegroundColorSpan
           import android.view.Gravity
           import android.view.View
           import android.view.inputmethod.EditorInfo
           import android.view.inputmethod.InputMethodManager
-          import android.widget.Button
           import android.widget.EditText
+          import android.widget.FrameLayout
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
 
           class MainActivity : Activity() {
 
               private lateinit var neural: NeuralView
               private lateinit var status: TextView
-              private lateinit var brainLine: TextView
-              private lateinit var toggle: Button
+              private lateinit var online: TextView
+              private lateinit var micIcon: IconView
+              private lateinit var micBg: GradientDrawable
               private lateinit var input: EditText
+              private lateinit var scrim: View
+              private lateinit var panel: LinearLayout
+              private var drawerOpen = false
               private var camUri: Uri? = null
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun dpf(v: Float) = v * resources.displayMetrics.density
 
-              private fun pill(fill: Int, stroke: Int, radiusDp: Int): GradientDrawable {
-                  val g = GradientDrawable()
-                  g.setColor(fill)
-                  g.cornerRadius = dp(radiusDp).toFloat()
-                  if (stroke != 0) g.setStroke(dp(1), stroke)
-                  return g
-              }
-
-              private fun circle(fill: Int, stroke: Int): GradientDrawable {
+              private fun oval(fill: Int, stroke: Int, strokeDp: Int): GradientDrawable {
                   val g = GradientDrawable()
                   g.shape = GradientDrawable.OVAL
                   g.setColor(fill)
-                  if (stroke != 0) g.setStroke(dp(1), stroke)
+                  g.setStroke(dp(strokeDp), stroke)
                   return g
+              }
+
+              private fun tile(kind: String, label: String, onClick: () -> Unit): LinearLayout {
+                  val t = LinearLayout(this)
+                  t.orientation = LinearLayout.VERTICAL
+                  t.gravity = Gravity.CENTER
+                  t.background = ChamferBg(Neon.PANEL, Neon.CYAN, dpf(9f), dpf(1.3f))
+                  t.addView(IconView(this, kind), LinearLayout.LayoutParams(dp(40), dp(40)))
+                  val tv = TextView(this)
+                  tv.text = label
+                  tv.textSize = 12f
+                  tv.setTextColor(Neon.TEXT)
+                  tv.gravity = Gravity.CENTER
+                  tv.setPadding(dp(4), 0, dp(4), 0)
+                  t.addView(tv)
+                  t.setOnClickListener { onClick() }
+                  return t
+              }
+
+              private fun gridRow(vararg tiles: View): LinearLayout {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  for (v in tiles) {
+                      val lp = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+                      lp.setMargins(dp(4), dp(3), dp(4), dp(3))
+                      row.addView(v, lp)
+                  }
+                  return row
+              }
+
+              private fun openChat(mode: String, fresh: Boolean = false, files: Boolean = false) {
+                  val i = Intent(this, ChatActivity::class.java)
+                  i.putExtra("mode", mode)
+                  i.putExtra("new", fresh)
+                  i.putExtra("files", files)
+                  startActivity(i)
               }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  window.statusBarColor = 0xFF050A14.toInt()
-                  window.navigationBarColor = 0xFF050A14.toInt()
+                  window.statusBarColor = Neon.BG
+                  window.navigationBarColor = Neon.BG
+
+                  val frame = FrameLayout(this)
+                  frame.setBackgroundColor(Neon.BG)
 
                   val root = LinearLayout(this)
                   root.orientation = LinearLayout.VERTICAL
-                  root.setBackgroundColor(0xFF050A14.toInt())
-                  root.setPadding(dp(16), dp(4), dp(16), dp(14))
+                  root.setPadding(dp(12), dp(4), dp(12), dp(10))
 
-                  // --- barra superior: reloj (historial) a la izquierda, engranaje a la derecha ---
+                  // ---- barra superior ----
                   val top = LinearLayout(this)
-                  top.orientation = LinearLayout.HORIZONTAL
                   top.gravity = Gravity.CENTER_VERTICAL
+                  val menu = IconView(this, "menu")
+                  menu.contentDescription = "Menú"
+                  menu.setOnClickListener { setDrawer(true) }
+                  top.addView(menu, LinearLayout.LayoutParams(dp(48), dp(48)))
 
-                  val clock = ClockIcon(this)
-                  clock.contentDescription = "Historial"
-                  clock.setPadding(dp(8), dp(8), dp(8), dp(8))
-                  clock.setOnClickListener { startActivity(Intent(this, HistoryActivity::class.java)) }
-                  top.addView(clock, LinearLayout.LayoutParams(dp(46), dp(46)))
+                  val mid = LinearLayout(this)
+                  mid.orientation = LinearLayout.VERTICAL
+                  mid.gravity = Gravity.CENTER
+                  val title = TextView(this)
+                  val ts = SpannableString("CERBERUS IA")
+                  ts.setSpan(ForegroundColorSpan(Neon.CYAN), 9, 11, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  title.text = ts
+                  title.textSize = 24f
+                  title.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD_ITALIC)
+                  title.setTextColor(Neon.TEXT)
+                  title.gravity = Gravity.CENTER
+                  mid.addView(title)
+                  val sub = TextView(this)
+                  sub.text = "Tu Asistente Inteligente"
+                  sub.textSize = 12f
+                  sub.setTextColor(Neon.TEXT)
+                  sub.gravity = Gravity.CENTER
+                  mid.addView(sub)
+                  top.addView(mid, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
-                  top.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-
-                  val gear = TextView(this)
-                  gear.text = "⚙"
-                  gear.textSize = 28f
-                  gear.gravity = Gravity.CENTER
-                  gear.setTextColor(0xFF2EC4FF.toInt())
-                  gear.contentDescription = "Ajustes"
-                  gear.setOnClickListener { startActivity(Intent(this, SettingsActivity::class.java)) }
-                  top.addView(gear, LinearLayout.LayoutParams(dp(46), dp(46)))
-
+                  online = TextView(this)
+                  online.textSize = 10f
+                  online.gravity = Gravity.CENTER
+                  online.minWidth = dp(48)
+                  top.addView(online, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(48)))
                   root.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-                  // --- red neuronal ---
+                  // ---- red neuronal ----
                   neural = NeuralView(this)
-                  root.addView(neural, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.25f))
+                  root.addView(neural, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
-                  // --- nombre pequeño ---
-                  val title = TextView(this)
-                  title.text = "CERBERUS"
-                  title.textSize = 15f
-                  title.letterSpacing = 0.4f
-                  title.typeface = Typeface.DEFAULT_BOLD
-                  title.setTextColor(0xFFE8F6FF.toInt())
-                  title.gravity = Gravity.CENTER
-                  root.addView(title)
-
-                  val sub = TextView(this)
-                  sub.text = "CREADO POR CARLOSART"
-                  sub.textSize = 9f
-                  sub.letterSpacing = 0.2f
-                  sub.setTextColor(0xFF2EC4FF.toInt())
-                  sub.gravity = Gravity.CENTER
-                  root.addView(sub)
-
-                  brainLine = TextView(this)
-                  brainLine.textSize = 10f
-                  brainLine.setTextColor(0xFF4F6A7D.toInt())
-                  brainLine.gravity = Gravity.CENTER
-                  brainLine.setPadding(0, dp(2), 0, 0)
-                  root.addView(brainLine)
-
-                  // --- estado / última respuesta ---
+                  // ---- saludo / estado ----
+                  val greetBox = LinearLayout(this)
+                  greetBox.gravity = Gravity.CENTER_VERTICAL
+                  greetBox.background = ChamferBg(Neon.PANEL, Neon.CYAN, dpf(10f), dpf(1.3f))
+                  greetBox.setPadding(dp(12), dp(6), dp(12), dp(6))
+                  greetBox.addView(IconView(this, "wave"), LinearLayout.LayoutParams(dp(44), dp(44)))
+                  val gcol = LinearLayout(this)
+                  gcol.orientation = LinearLayout.VERTICAL
+                  gcol.setPadding(dp(8), 0, 0, 0)
+                  val greet = TextView(this)
+                  greet.text = "Hola, señor 👋"
+                  greet.textSize = 19f
+                  greet.typeface = Typeface.DEFAULT_BOLD
+                  greet.setTextColor(Neon.TEXT)
+                  gcol.addView(greet)
                   status = TextView(this)
-                  status.text = "A sus órdenes, señor."
-                  status.textSize = 16f
-                  status.setTextColor(0xFFB8CCDA.toInt())
-                  status.gravity = Gravity.CENTER
-                  status.setPadding(dp(8), dp(8), dp(8), dp(8))
-                  root.addView(status, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.75f))
+                  status.text = "¿En qué puedo ayudarle?"
+                  status.textSize = 14f
+                  status.setTextColor(0xFF38E1FF.toInt())
+                  status.maxLines = 3
+                  status.ellipsize = android.text.TextUtils.TruncateAt.END
+                  gcol.addView(status)
+                  greetBox.addView(gcol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  val glp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  glp.setMargins(dp(4), dp(4), dp(4), dp(4))
+                  root.addView(greetBox, glp)
 
-                  // --- botón Activar pequeño ---
-                  toggle = Button(this)
-                  toggle.textSize = 13f
-                  toggle.transformationMethod = null
-                  toggle.setTextColor(0xFFE8F6FF.toInt())
-                  toggle.background = pill(0xFF0C1824.toInt(), 0xFF2EC4FF.toInt(), 20)
-                  toggle.setPadding(dp(26), 0, dp(26), 0)
-                  toggle.setOnClickListener { toggleService() }
-                  val tl = LinearLayout(this)
-                  tl.gravity = Gravity.CENTER
-                  tl.addView(toggle, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(40)))
-                  root.addView(tl, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  // ---- cuadrícula de funciones ----
+                  val grid = LinearLayout(this)
+                  grid.orientation = LinearLayout.VERTICAL
+                  grid.addView(
+                      gridRow(
+                          tile("chat", "Nuevo Chat") { openChat("chat", true) },
+                          tile("image", "Generar\nImagen") { openChat("image") },
+                          tile("video", "Generar\nVideo") { openChat("video") }
+                      ), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80))
+                  )
+                  grid.addView(
+                      gridRow(
+                          tile("code", "Generar\nCódigo") { openChat("code") },
+                          tile("tiktok", "Crear\nTikTok") { openChat("tiktok") },
+                          tile("folder", "Archivos") { openChat("chat", false, true) }
+                      ), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(80))
+                  )
+                  root.addView(grid, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-                  // --- barra de escritura: + | texto | enviar ---
+                  // ---- galería | micrófono | archivo ----
+                  val ctl = LinearLayout(this)
+                  ctl.gravity = Gravity.CENTER
+                  ctl.setPadding(0, dp(6), 0, dp(4))
+                  val gal = IconView(this, "image")
+                  gal.background = oval(Neon.PANEL, Neon.CYAN, 1)
+                  gal.contentDescription = "Foto"
+                  gal.setOnClickListener { showPlusMenu() }
+                  ctl.addView(gal, LinearLayout.LayoutParams(dp(54), dp(54)))
+
+                  micIcon = IconView(this, "mic")
+                  micBg = oval(Neon.PANEL, Neon.CYAN, 2)
+                  micIcon.background = micBg
+                  micIcon.contentDescription = "Activar o detener"
+                  micIcon.setOnClickListener { toggleService() }
+                  val mlp = LinearLayout.LayoutParams(dp(82), dp(82))
+                  mlp.setMargins(dp(26), 0, dp(26), 0)
+                  ctl.addView(micIcon, mlp)
+
+                  val clip = IconView(this, "clip")
+                  clip.background = oval(Neon.PANEL, Neon.CYAN, 1)
+                  clip.contentDescription = "Archivo"
+                  clip.setOnClickListener { pick("*/*", 12) }
+                  ctl.addView(clip, LinearLayout.LayoutParams(dp(54), dp(54)))
+                  root.addView(ctl, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  // ---- barra de escritura ----
                   val bar = LinearLayout(this)
-                  bar.orientation = LinearLayout.HORIZONTAL
                   bar.gravity = Gravity.CENTER_VERTICAL
-                  bar.setPadding(0, dp(10), 0, 0)
-
-                  val plus = TextView(this)
-                  plus.text = "+"
-                  plus.textSize = 26f
-                  plus.gravity = Gravity.CENTER
-                  plus.setTextColor(0xFF2EC4FF.toInt())
-                  plus.background = circle(0xFF0C1824.toInt(), 0xFF1C3347.toInt())
-                  plus.contentDescription = "Adjuntar"
-                  plus.setOnClickListener { showPlusMenu() }
-                  bar.addView(plus, LinearLayout.LayoutParams(dp(46), dp(46)))
-
+                  bar.background = ChamferBg(Neon.PANEL, 0xFF1C5A78.toInt(), dpf(10f), dpf(1.3f))
+                  bar.setPadding(dp(8), 0, dp(6), 0)
                   input = EditText(this)
-                  input.hint = "Escríbale a Cerberus…"
-                  input.setHintTextColor(0xFF5C7A90.toInt())
-                  input.setTextColor(0xFFE8F6FF.toInt())
+                  input.hint = "Habla o escribe…"
+                  input.setHintTextColor(0xFF7FA6BC.toInt())
+                  input.setTextColor(Neon.TEXT)
                   input.textSize = 15f
                   input.setSingleLine(true)
+                  input.gravity = Gravity.CENTER_VERTICAL
                   input.imeOptions = EditorInfo.IME_ACTION_SEND
-                  input.background = pill(0xFF0C1824.toInt(), 0xFF1C3347.toInt(), 23)
-                  input.setPadding(dp(18), 0, dp(18), 0)
+                  input.setBackgroundColor(0)
+                  input.setPadding(dp(12), 0, dp(8), 0)
                   input.setOnEditorActionListener { _, id, _ ->
                       if (id == EditorInfo.IME_ACTION_SEND) { sendText(); true } else false
                   }
-                  val ilp = LinearLayout.LayoutParams(0, dp(46), 1f)
-                  ilp.leftMargin = dp(8)
-                  ilp.rightMargin = dp(8)
-                  bar.addView(input, ilp)
-
-                  val send = TextView(this)
-                  send.text = "↑"
-                  send.textSize = 22f
-                  send.typeface = Typeface.DEFAULT_BOLD
-                  send.gravity = Gravity.CENTER
-                  send.setTextColor(0xFF04131D.toInt())
-                  send.background = circle(0xFF2EC4FF.toInt(), 0)
+                  bar.addView(input, LinearLayout.LayoutParams(0, dp(48), 1f))
+                  val send = IconView(this, "send")
                   send.contentDescription = "Enviar"
                   send.setOnClickListener { sendText() }
-                  bar.addView(send, LinearLayout.LayoutParams(dp(46), dp(46)))
+                  bar.addView(send, LinearLayout.LayoutParams(dp(44), dp(44)))
+                  val blp = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                  blp.setMargins(dp(4), dp(2), dp(4), 0)
+                  root.addView(bar, blp)
 
-                  root.addView(bar, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  frame.addView(root, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
-                  setContentView(root)
+                  // ---- menú lateral ----
+                  scrim = View(this)
+                  scrim.setBackgroundColor(0xAA000000.toInt())
+                  scrim.visibility = View.GONE
+                  scrim.setOnClickListener { setDrawer(false) }
+                  frame.addView(scrim, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  panel = buildPanel()
+                  val pw = (resources.displayMetrics.widthPixels * 0.8f).toInt()
+                  panel.translationX = -pw.toFloat()
+                  frame.addView(panel, FrameLayout.LayoutParams(pw, FrameLayout.LayoutParams.MATCH_PARENT))
+
+                  setContentView(frame)
+                  window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+              }
+
+              private fun buildPanel(): LinearLayout {
+                  val p = LinearLayout(this)
+                  p.orientation = LinearLayout.VERTICAL
+                  p.background = ChamferBg(0xF5051427.toInt(), Neon.CYAN, dpf(14f), dpf(1.4f))
+                  p.setPadding(dp(16), dp(24), dp(12), dp(16))
+
+                  val name = TextView(this)
+                  val ns = SpannableString("CERBERUS IA")
+                  ns.setSpan(ForegroundColorSpan(Neon.CYAN), 9, 11, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  name.text = ns
+                  name.textSize = 24f
+                  name.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD_ITALIC)
+                  name.setTextColor(Neon.TEXT)
+                  p.addView(name)
+                  val cr = TextView(this)
+                  val cs = SpannableString("Creador: CarlosArt")
+                  cs.setSpan(ForegroundColorSpan(Neon.CYAN), 9, 18, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  cr.text = cs
+                  cr.textSize = 13f
+                  cr.setTextColor(Neon.TEXT)
+                  cr.setPadding(0, 0, 0, dp(12))
+                  p.addView(cr)
+
+                  val items = LinearLayout(this)
+                  items.orientation = LinearLayout.VERTICAL
+                  fun item(kind: String, label: String, selected: Boolean = false, action: () -> Unit) {
+                      val row = LinearLayout(this)
+                      row.gravity = Gravity.CENTER_VERTICAL
+                      row.setPadding(dp(10), 0, dp(10), 0)
+                      if (selected) row.background = ChamferBg(0x331FD8FF, Neon.CYAN, dpf(8f), dpf(1.2f))
+                      row.addView(IconView(this, kind), LinearLayout.LayoutParams(dp(40), dp(40)))
+                      val tv = TextView(this)
+                      tv.text = label
+                      tv.textSize = 15f
+                      tv.setTextColor(Neon.TEXT)
+                      tv.setPadding(dp(10), 0, 0, 0)
+                      row.addView(tv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                      row.setOnClickListener {
+                          setDrawer(false)
+                          action()
+                      }
+                      items.addView(row, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+                  }
+                  item("home", "Inicio", true) { }
+                  item("chat", "Nuevo Chat") { openChat("chat", true) }
+                  item("mic", "Asistente de Voz") { if (!Bus.running) toggleService() }
+                  item("image", "Generar Imagen") { openChat("image") }
+                  item("video", "Generar Video") { openChat("video") }
+                  item("code", "Generar Código") { openChat("code") }
+                  item("tiktok", "Crear TikTok") { openChat("tiktok") }
+                  item("folder", "Archivos") { openChat("chat", false, true) }
+                  item("history", "Historial de Conversación") { startActivity(Intent(this, HistoryActivity::class.java)) }
+                  item("bars", "Información en Tiempo Real") { openChat("info") }
+                  item("gear", "Configuración") { startActivity(Intent(this, SettingsActivity::class.java)) }
+                  item("about", "Acerca de Cerberus") {
+                      AlertDialog.Builder(this)
+                          .setTitle("Cerberus IA")
+                          .setMessage("Asistente personal con voz, cámara, búsqueda en internet y control del teléfono.\n\nVersión " + appVersion() + "\nCreador: CarlosArt")
+                          .setPositiveButton("Cerrar", null)
+                          .show()
+                  }
+                  val sv = ScrollView(this)
+                  sv.addView(items)
+                  p.addView(sv, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+                  val foot = TextView(this)
+                  val fs = SpannableString("Creador: CarlosArt")
+                  fs.setSpan(ForegroundColorSpan(Neon.CYAN), 9, 18, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  foot.text = fs
+                  foot.textSize = 13f
+                  foot.gravity = Gravity.CENTER
+                  foot.setTextColor(Neon.TEXT)
+                  foot.setPadding(0, dp(10), 0, 0)
+                  p.addView(foot)
+                  return p
+              }
+
+              private fun appVersion(): String = try {
+                  packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+              } catch (e: Exception) {
+                  ""
+              }
+
+              private fun setDrawer(open: Boolean) {
+                  drawerOpen = open
+                  val pw = panel.width.takeIf { it > 0 } ?: (resources.displayMetrics.widthPixels * 0.8f).toInt()
+                  if (open) {
+                      scrim.alpha = 0f
+                      scrim.visibility = View.VISIBLE
+                      scrim.animate().alpha(1f).setDuration(180).start()
+                      panel.animate().translationX(0f).setDuration(200).start()
+                  } else {
+                      scrim.animate().alpha(0f).setDuration(160).withEndAction { scrim.visibility = View.GONE }.start()
+                      panel.animate().translationX(-pw.toFloat()).setDuration(180).start()
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (drawerOpen) setDrawer(false) else super.onBackPressed()
+              }
+
+              private fun isOnline(): Boolean {
+                  return try {
+                      val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                      val n = cm.activeNetwork ?: return false
+                      cm.getNetworkCapabilities(n)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+                  } catch (e: Exception) {
+                      true
+                  }
+              }
+
+              private fun refreshOnline() {
+                  val prov = Cfg.provider(this)
+                  if (Cfg.key(this, prov).isEmpty()) {
+                      online.text = "●\nSin clave"
+                      online.setTextColor(0xFFFFB347.toInt())
+                  } else if (!isOnline()) {
+                      online.text = "●\nSin internet"
+                      online.setTextColor(0xFFFFB347.toInt())
+                  } else {
+                      online.text = "●\nEn línea"
+                      online.setTextColor(Neon.GREEN)
+                  }
               }
 
               override fun onResume() {
@@ -1925,11 +2398,11 @@ jobs:
                       if (text.isNotEmpty()) status.text = text
                   }
                   val prov = Cfg.provider(this)
-                  brainLine.text = Cfg.name(prov) + " · " + Cfg.model(this, prov).ifEmpty { "sin modelo" }
                   if (Cfg.key(this, prov).isEmpty() && !Bus.running) {
-                      status.text = "Toque ⚙ y configure su clave, señor."
+                      status.text = "Abra el menú → Configuración y ponga su clave, señor."
                   }
                   neural.state = if (Bus.running) "listening" else "idle"
+                  refreshOnline()
                   refreshButton()
               }
 
@@ -1939,7 +2412,9 @@ jobs:
               }
 
               private fun refreshButton() {
-                  toggle.text = if (Bus.running) "Detener" else "Activar"
+                  val on = Bus.running
+                  micBg.setColor(if (on) Neon.CYAN else Neon.PANEL)
+                  micIcon.setColor(if (on) 0xFF04131D.toInt() else Neon.CYAN)
               }
 
               private fun hasMic() =
@@ -1953,12 +2428,13 @@ jobs:
                       status.text = "Cerberus desactivado."
                   } else {
                       if (!hasMic()) {
-                          status.text = "Necesito permisos, señor. Acéptelos o use ⚙."
+                          status.text = "Necesito permisos, señor. Acéptelos."
                           askPermissions()
                           return
                       }
                       startForegroundService(Intent(this, CerberusService::class.java))
                       Bus.running = true
+                      status.text = "Escuchando… diga \"Cerberus\"."
                   }
                   refreshButton()
               }
@@ -1992,7 +2468,7 @@ jobs:
                   }
               }
 
-              // ---------- botón + : fotos, cámara y archivos ----------
+              // ---------- fotos, cámara y archivos ----------
 
               private fun showPlusMenu() {
                   AlertDialog.Builder(this)
@@ -2094,6 +2570,251 @@ jobs:
               override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults)
                   status.text = "Permisos procesados. Ya puede activar a Cerberus, señor."
+              }
+          }
+          CERBEOF
+          mkdir -p app/src/main/java/com/carlosart/cerberus
+          cat > app/src/main/java/com/carlosart/cerberus/Neon.kt <<'CERBEOF'
+          package com.carlosart.cerberus
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.ColorFilter
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Rect
+          import android.graphics.RectF
+          import android.graphics.drawable.Drawable
+          import android.view.View
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          object Neon {
+              const val BG = 0xFF030A18.toInt()
+              const val CYAN = 0xFF1FD8FF.toInt()
+              const val PANEL = 0xFF071A2E.toInt()
+              const val TEXT = 0xFFE8F6FF.toInt()
+              const val DIM = 0xFF8DA5B6.toInt()
+              const val GREEN = 0xFF3DFF7A.toInt()
+          }
+
+          /** Marco con esquinas cortadas y brillo neón. */
+          class ChamferBg(private val fill: Int, private val stroke: Int, private val cut: Float, private val sw: Float) : Drawable() {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val path = Path()
+
+              override fun onBoundsChange(b: Rect) {
+                  val l = b.left + sw * 2f
+                  val t = b.top + sw * 2f
+                  val r = b.right - sw * 2f
+                  val bt = b.bottom - sw * 2f
+                  path.reset()
+                  path.moveTo(l + cut, t)
+                  path.lineTo(r - cut, t)
+                  path.lineTo(r, t + cut)
+                  path.lineTo(r, bt - cut)
+                  path.lineTo(r - cut, bt)
+                  path.lineTo(l + cut, bt)
+                  path.lineTo(l, bt - cut)
+                  path.lineTo(l, t + cut)
+                  path.close()
+              }
+
+              override fun draw(c: Canvas) {
+                  p.style = Paint.Style.FILL
+                  p.color = fill
+                  c.drawPath(path, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeJoin = Paint.Join.ROUND
+                  p.strokeWidth = sw * 3f
+                  p.color = (stroke and 0xFFFFFF) or (0x30 shl 24)
+                  c.drawPath(path, p)
+                  p.strokeWidth = sw
+                  p.color = stroke
+                  c.drawPath(path, p)
+              }
+
+              override fun setAlpha(alpha: Int) {}
+              override fun setColorFilter(colorFilter: ColorFilter?) {}
+
+              @Suppress("DEPRECATION")
+              override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+          }
+
+          /** Iconos de línea dibujados a mano (sin imágenes). */
+          class IconView(c: Context, private val kind: String, private var col: Int = Neon.CYAN) : View(c) {
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val d = c.resources.displayMetrics.density
+              private val rf = RectF()
+
+              fun setColor(c: Int) {
+                  col = c
+                  invalidate()
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val s = minOf(w, h) * 0.62f
+                  val x0 = (w - s) / 2f
+                  val y0 = (h - s) / 2f
+                  fun x(f: Float) = x0 + s * f
+                  fun y(f: Float) = y0 + s * f
+                  p.style = Paint.Style.STROKE
+                  p.color = col
+                  p.strokeWidth = maxOf(1.6f * d, s * 0.085f)
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.strokeJoin = Paint.Join.ROUND
+                  val path = Path()
+                  when (kind) {
+                      "menu" -> {
+                          for (f in floatArrayOf(0.2f, 0.5f, 0.8f)) cv.drawLine(x(0.05f), y(f), x(0.95f), y(f), p)
+                      }
+                      "chat" -> {
+                          rf.set(x(0.05f), y(0.1f), x(0.95f), y(0.72f))
+                          cv.drawRoundRect(rf, s * 0.18f, s * 0.18f, p)
+                          path.moveTo(x(0.3f), y(0.72f))
+                          path.lineTo(x(0.2f), y(0.95f))
+                          path.lineTo(x(0.5f), y(0.72f))
+                          cv.drawPath(path, p)
+                          p.style = Paint.Style.FILL
+                          for (f in floatArrayOf(0.3f, 0.5f, 0.7f)) cv.drawCircle(x(f), y(0.41f), s * 0.055f, p)
+                      }
+                      "mic" -> {
+                          rf.set(x(0.34f), y(0.02f), x(0.66f), y(0.55f))
+                          cv.drawRoundRect(rf, s * 0.16f, s * 0.16f, p)
+                          rf.set(x(0.18f), y(0.25f), x(0.82f), y(0.78f))
+                          cv.drawArc(rf, 0f, 180f, false, p)
+                          cv.drawLine(x(0.5f), y(0.78f), x(0.5f), y(0.97f), p)
+                          cv.drawLine(x(0.34f), y(0.97f), x(0.66f), y(0.97f), p)
+                      }
+                      "image" -> {
+                          rf.set(x(0.05f), y(0.1f), x(0.95f), y(0.9f))
+                          cv.drawRoundRect(rf, s * 0.1f, s * 0.1f, p)
+                          path.moveTo(x(0.06f), y(0.78f))
+                          path.lineTo(x(0.36f), y(0.48f))
+                          path.lineTo(x(0.56f), y(0.68f))
+                          path.lineTo(x(0.7f), y(0.55f))
+                          path.lineTo(x(0.94f), y(0.78f))
+                          cv.drawPath(path, p)
+                          p.style = Paint.Style.FILL
+                          cv.drawCircle(x(0.72f), y(0.3f), s * 0.07f, p)
+                      }
+                      "video" -> {
+                          rf.set(x(0.05f), y(0.1f), x(0.95f), y(0.9f))
+                          cv.drawRoundRect(rf, s * 0.1f, s * 0.1f, p)
+                          p.style = Paint.Style.FILL
+                          path.moveTo(x(0.4f), y(0.3f))
+                          path.lineTo(x(0.4f), y(0.7f))
+                          path.lineTo(x(0.7f), y(0.5f))
+                          path.close()
+                          cv.drawPath(path, p)
+                      }
+                      "code" -> {
+                          path.moveTo(x(0.33f), y(0.25f))
+                          path.lineTo(x(0.08f), y(0.5f))
+                          path.lineTo(x(0.33f), y(0.75f))
+                          cv.drawPath(path, p)
+                          path.reset()
+                          path.moveTo(x(0.67f), y(0.25f))
+                          path.lineTo(x(0.92f), y(0.5f))
+                          path.lineTo(x(0.67f), y(0.75f))
+                          cv.drawPath(path, p)
+                          cv.drawLine(x(0.58f), y(0.12f), x(0.42f), y(0.88f), p)
+                      }
+                      "tiktok" -> {
+                          cv.drawLine(x(0.62f), y(0.08f), x(0.62f), y(0.72f), p)
+                          cv.drawLine(x(0.62f), y(0.08f), x(0.9f), y(0.3f), p)
+                          cv.drawCircle(x(0.42f), y(0.76f), s * 0.18f, p)
+                      }
+                      "folder" -> {
+                          path.moveTo(x(0.05f), y(0.2f))
+                          path.lineTo(x(0.38f), y(0.2f))
+                          path.lineTo(x(0.5f), y(0.35f))
+                          path.lineTo(x(0.95f), y(0.35f))
+                          path.lineTo(x(0.95f), y(0.85f))
+                          path.lineTo(x(0.05f), y(0.85f))
+                          path.close()
+                          cv.drawPath(path, p)
+                      }
+                      "history" -> {
+                          cv.drawCircle(x(0.5f), y(0.5f), s * 0.44f, p)
+                          cv.drawLine(x(0.5f), y(0.5f), x(0.5f), y(0.24f), p)
+                          cv.drawLine(x(0.5f), y(0.5f), x(0.68f), y(0.58f), p)
+                      }
+                      "bars" -> {
+                          p.style = Paint.Style.FILL
+                          val hs = floatArrayOf(0.4f, 0.7f, 1f)
+                          for (i in 0 until 3) {
+                              rf.set(x(0.08f + i * 0.31f), y(1f - hs[i]), x(0.28f + i * 0.31f), y(1f))
+                              cv.drawRect(rf, p)
+                          }
+                      }
+                      "gear" -> {
+                          cv.drawCircle(x(0.5f), y(0.5f), s * 0.2f, p)
+                          for (i in 0 until 8) {
+                              val a = i * Math.PI / 4.0
+                              val ca = cos(a).toFloat()
+                              val sa = sin(a).toFloat()
+                              cv.drawLine(x(0.5f + 0.31f * ca), y(0.5f + 0.31f * sa), x(0.5f + 0.45f * ca), y(0.5f + 0.45f * sa), p)
+                          }
+                          cv.drawCircle(x(0.5f), y(0.5f), s * 0.31f, p)
+                      }
+                      "about" -> {
+                          cv.drawCircle(x(0.5f), y(0.5f), s * 0.44f, p)
+                          cv.drawLine(x(0.5f), y(0.46f), x(0.5f), y(0.72f), p)
+                          p.style = Paint.Style.FILL
+                          cv.drawCircle(x(0.5f), y(0.3f), s * 0.05f, p)
+                      }
+                      "home" -> {
+                          path.moveTo(x(0.05f), y(0.5f))
+                          path.lineTo(x(0.5f), y(0.1f))
+                          path.lineTo(x(0.95f), y(0.5f))
+                          cv.drawPath(path, p)
+                          path.reset()
+                          path.moveTo(x(0.2f), y(0.42f))
+                          path.lineTo(x(0.2f), y(0.9f))
+                          path.lineTo(x(0.8f), y(0.9f))
+                          path.lineTo(x(0.8f), y(0.42f))
+                          cv.drawPath(path, p)
+                      }
+                      "clip" -> {
+                          cv.save()
+                          cv.rotate(35f, x(0.5f), y(0.5f))
+                          rf.set(x(0.32f), y(0.02f), x(0.68f), y(0.98f))
+                          cv.drawRoundRect(rf, s * 0.18f, s * 0.18f, p)
+                          cv.drawLine(x(0.5f), y(0.28f), x(0.5f), y(0.7f), p)
+                          cv.restore()
+                      }
+                      "send" -> {
+                          cv.drawLine(x(0.5f), y(0.88f), x(0.5f), y(0.14f), p)
+                          path.moveTo(x(0.18f), y(0.44f))
+                          path.lineTo(x(0.5f), y(0.12f))
+                          path.lineTo(x(0.82f), y(0.44f))
+                          cv.drawPath(path, p)
+                      }
+                      "back" -> {
+                          cv.drawLine(x(0.9f), y(0.5f), x(0.1f), y(0.5f), p)
+                          path.moveTo(x(0.4f), y(0.18f))
+                          path.lineTo(x(0.08f), y(0.5f))
+                          path.lineTo(x(0.4f), y(0.82f))
+                          cv.drawPath(path, p)
+                      }
+                      "wave" -> {
+                          p.strokeWidth = maxOf(2f * d, s * 0.1f)
+                          val hs = floatArrayOf(0.25f, 0.55f, 0.9f, 0.5f, 0.7f, 0.3f)
+                          for (i in hs.indices) {
+                              val xx = x(0.08f + i * 0.168f)
+                              cv.drawLine(xx, y(0.5f - hs[i] / 2f), xx, y(0.5f + hs[i] / 2f), p)
+                          }
+                      }
+                      "close" -> {
+                          cv.drawLine(x(0.15f), y(0.15f), x(0.85f), y(0.85f), p)
+                          cv.drawLine(x(0.85f), y(0.15f), x(0.15f), y(0.85f), p)
+                      }
+                  }
               }
           }
           CERBEOF
@@ -2818,6 +3539,14 @@ jobs:
                   return out
               }
 
+              /** Cierra la conversación actual: el próximo mensaje abre una nueva. */
+              @Synchronized fun newConversation(c: Context) {
+                  val all = read(c, "chats.json")
+                  if (all.length() == 0) return
+                  all.getJSONObject(all.length() - 1).put("ts", 0L)
+                  write(c, "chats.json", all)
+              }
+
               @Synchronized fun clearChats(c: Context) = write(c, "chats.json", JSONArray())
 
               // ---------- datos recordados ----------
@@ -3261,8 +3990,13 @@ jobs:
       - name: Compilar APK
         run: gradle assembleDebug --stacktrace
 
+      - name: Nombrar el APK
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Cerberus-v10.1.apk
+
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
-          name: Cerberus-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: Cerberus-v10.1
+          path: dist/Cerberus-v10.1.apk
