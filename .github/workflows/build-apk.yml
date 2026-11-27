@@ -59,8 +59,8 @@ jobs:
                   applicationId 'com.carlosart.cerberus'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1001
-                  versionName '10.1'
+                  versionCode 1101
+                  versionName '11.1'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -2040,6 +2040,8 @@ jobs:
           class MainActivity : Activity() {
 
               private lateinit var neural: NeuralView
+              private lateinit var waveL: WaveView
+              private lateinit var waveR: WaveView
               private lateinit var status: TextView
               private lateinit var online: TextView
               private lateinit var micIcon: IconView
@@ -2104,6 +2106,7 @@ jobs:
 
                   val frame = FrameLayout(this)
                   frame.setBackgroundColor(Neon.BG)
+                  frame.addView(HudBackground(this), FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
 
                   val root = LinearLayout(this)
                   root.orientation = LinearLayout.VERTICAL
@@ -2127,6 +2130,7 @@ jobs:
                   title.textSize = 24f
                   title.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD_ITALIC)
                   title.setTextColor(Neon.TEXT)
+                  title.setShadowLayer(dpf(10f), 0f, 0f, Neon.CYAN)
                   title.gravity = Gravity.CENTER
                   mid.addView(title)
                   val sub = TextView(this)
@@ -2162,6 +2166,7 @@ jobs:
                   greet.textSize = 19f
                   greet.typeface = Typeface.DEFAULT_BOLD
                   greet.setTextColor(Neon.TEXT)
+                  greet.setShadowLayer(dpf(8f), 0f, 0f, Neon.CYAN)
                   gcol.addView(greet)
                   status = TextView(this)
                   status.text = "¿En qué puedo ayudarle?"
@@ -2199,14 +2204,17 @@ jobs:
                   ctl.gravity = Gravity.CENTER
                   ctl.setPadding(0, dp(6), 0, dp(4))
                   val gal = IconView(this, "image")
-                  gal.background = oval(Neon.PANEL, Neon.CYAN, 1)
+                  gal.background = oval(Neon.PANEL, Neon.CYAN, 2)
                   gal.contentDescription = "Foto"
                   gal.setOnClickListener { showPlusMenu() }
                   ctl.addView(gal, LinearLayout.LayoutParams(dp(54), dp(54)))
 
                   micIcon = IconView(this, "mic")
                   micBg = oval(Neon.PANEL, Neon.CYAN, 2)
-                  micIcon.background = micBg
+                  val micRing = oval(0, 0x881FD8FF.toInt(), 1)
+                  val micLayers = android.graphics.drawable.LayerDrawable(arrayOf<android.graphics.drawable.Drawable>(micRing, micBg))
+                  micLayers.setLayerInset(1, dp(7), dp(7), dp(7), dp(7))
+                  micIcon.background = micLayers
                   micIcon.contentDescription = "Activar o detener"
                   micIcon.setOnClickListener { toggleService() }
                   val mlp = LinearLayout.LayoutParams(dp(82), dp(82))
@@ -2214,7 +2222,7 @@ jobs:
                   ctl.addView(micIcon, mlp)
 
                   val clip = IconView(this, "clip")
-                  clip.background = oval(Neon.PANEL, Neon.CYAN, 1)
+                  clip.background = oval(Neon.PANEL, Neon.CYAN, 2)
                   clip.contentDescription = "Archivo"
                   clip.setOnClickListener { pick("*/*", 12) }
                   ctl.addView(clip, LinearLayout.LayoutParams(dp(54), dp(54)))
@@ -2234,11 +2242,16 @@ jobs:
                   input.gravity = Gravity.CENTER_VERTICAL
                   input.imeOptions = EditorInfo.IME_ACTION_SEND
                   input.setBackgroundColor(0)
-                  input.setPadding(dp(12), 0, dp(8), 0)
+                  input.setPadding(dp(4), 0, dp(4), 0)
                   input.setOnEditorActionListener { _, id, _ ->
                       if (id == EditorInfo.IME_ACTION_SEND) { sendText(); true } else false
                   }
+                  waveL = WaveView(this, true)
+                  waveR = WaveView(this, false)
+                  bar.addView(waveL, LinearLayout.LayoutParams(dp(44), dp(30)))
+                  input.gravity = Gravity.CENTER
                   bar.addView(input, LinearLayout.LayoutParams(0, dp(48), 1f))
+                  bar.addView(waveR, LinearLayout.LayoutParams(dp(44), dp(30)))
                   val send = IconView(this, "send")
                   send.contentDescription = "Enviar"
                   send.setOnClickListener { sendText() }
@@ -2263,6 +2276,12 @@ jobs:
 
                   setContentView(frame)
                   window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+              }
+
+              private fun applyState(s: String) {
+                  neural.state = s
+                  waveL.state = s
+                  waveR.state = s
               }
 
               private fun buildPanel(): LinearLayout {
@@ -2394,14 +2413,14 @@ jobs:
               override fun onResume() {
                   super.onResume()
                   Bus.listener = { state, text ->
-                      neural.state = state
+                      applyState(state)
                       if (text.isNotEmpty()) status.text = text
                   }
                   val prov = Cfg.provider(this)
                   if (Cfg.key(this, prov).isEmpty() && !Bus.running) {
                       status.text = "Abra el menú → Configuración y ponga su clave, señor."
                   }
-                  neural.state = if (Bus.running) "listening" else "idle"
+                  applyState(if (Bus.running) "listening" else "idle")
                   refreshOnline()
                   refreshButton()
               }
@@ -2424,7 +2443,7 @@ jobs:
                   if (Bus.running) {
                       stopService(Intent(this, CerberusService::class.java))
                       Bus.running = false
-                      neural.state = "idle"
+                      applyState("idle")
                       status.text = "Cerberus desactivado."
                   } else {
                       if (!hasMic()) {
@@ -2450,7 +2469,7 @@ jobs:
                           .hideSoftInputFromWindow(input.windowToken, 0)
                   } catch (e: Exception) { }
                   status.text = q
-                  neural.state = "thinking"
+                  applyState("thinking")
                   if (Bus.running) {
                       val i = Intent(this, CerberusService::class.java)
                       i.action = "ASK_TEXT"
@@ -2461,7 +2480,7 @@ jobs:
                       Thread {
                           val ans = Actions(app).tryHandle(q) ?: Brain(app).ask(q)
                           runOnUiThread {
-                              neural.state = "idle"
+                              applyState("idle")
                               status.text = ans
                           }
                       }.start()
@@ -2532,12 +2551,12 @@ jobs:
                       return
                   }
                   status.text = "Leyendo el archivo…"
-                  neural.state = "thinking"
+                  applyState("thinking")
                   Thread {
                       val att = Attach.fromUri(this, uri)
                       runOnUiThread {
                           if (att == null) {
-                              neural.state = "idle"
+                              applyState("idle")
                               status.text = "No pude leer ese archivo, señor."
                           } else {
                               Attach.stash(this, att)
@@ -2580,12 +2599,15 @@ jobs:
           import android.content.Context
           import android.graphics.Canvas
           import android.graphics.ColorFilter
+          import android.graphics.LinearGradient
+          import android.graphics.Shader
           import android.graphics.Paint
           import android.graphics.Path
           import android.graphics.PixelFormat
           import android.graphics.Rect
           import android.graphics.RectF
           import android.graphics.drawable.Drawable
+          import android.animation.ValueAnimator
           import android.view.View
           import kotlin.math.cos
           import kotlin.math.sin
@@ -2603,8 +2625,11 @@ jobs:
           class ChamferBg(private val fill: Int, private val stroke: Int, private val cut: Float, private val sw: Float) : Drawable() {
               private val p = Paint(Paint.ANTI_ALIAS_FLAG)
               private val path = Path()
+              private var shader: Shader? = null
 
               override fun onBoundsChange(b: Rect) {
+                  val topCol = (0xFF shl 24) or (((fill shr 16 and 0xFF) + 0x10).coerceAtMost(255) shl 16) or (((fill shr 8 and 0xFF) + 0x28).coerceAtMost(255) shl 8) or ((fill and 0xFF) + 0x3A).coerceAtMost(255)
+                  shader = LinearGradient(0f, b.top.toFloat(), 0f, b.bottom.toFloat(), topCol, fill, Shader.TileMode.CLAMP)
                   val l = b.left + sw * 2f
                   val t = b.top + sw * 2f
                   val r = b.right - sw * 2f
@@ -2624,11 +2649,16 @@ jobs:
               override fun draw(c: Canvas) {
                   p.style = Paint.Style.FILL
                   p.color = fill
+                  p.shader = shader
                   c.drawPath(path, p)
+                  p.shader = null
                   p.style = Paint.Style.STROKE
                   p.strokeJoin = Paint.Join.ROUND
-                  p.strokeWidth = sw * 3f
-                  p.color = (stroke and 0xFFFFFF) or (0x30 shl 24)
+                  p.strokeWidth = sw * 6f
+                  p.color = (stroke and 0xFFFFFF) or (0x1C shl 24)
+                  c.drawPath(path, p)
+                  p.strokeWidth = sw * 3.2f
+                  p.color = (stroke and 0xFFFFFF) or (0x40 shl 24)
                   c.drawPath(path, p)
                   p.strokeWidth = sw
                   p.color = stroke
@@ -2655,6 +2685,11 @@ jobs:
               }
 
               override fun onDraw(cv: Canvas) {
+                  render(cv, true)
+                  render(cv, false)
+              }
+
+              private fun render(cv: Canvas, glow: Boolean) {
                   val w = width.toFloat()
                   val h = height.toFloat()
                   val s = minOf(w, h) * 0.62f
@@ -2663,8 +2698,8 @@ jobs:
                   fun x(f: Float) = x0 + s * f
                   fun y(f: Float) = y0 + s * f
                   p.style = Paint.Style.STROKE
-                  p.color = col
-                  p.strokeWidth = maxOf(1.6f * d, s * 0.085f)
+                  p.color = if (glow) (col and 0xFFFFFF) or (0x38 shl 24) else col
+                  p.strokeWidth = maxOf(1.6f * d, s * 0.085f) * (if (glow) 3f else 1f)
                   p.strokeCap = Paint.Cap.ROUND
                   p.strokeJoin = Paint.Join.ROUND
                   val path = Path()
@@ -2803,7 +2838,7 @@ jobs:
                           cv.drawPath(path, p)
                       }
                       "wave" -> {
-                          p.strokeWidth = maxOf(2f * d, s * 0.1f)
+                          p.strokeWidth = maxOf(2f * d, s * 0.1f) * (if (glow) 3f else 1f)
                           val hs = floatArrayOf(0.25f, 0.55f, 0.9f, 0.5f, 0.7f, 0.3f)
                           for (i in hs.indices) {
                               val xx = x(0.08f + i * 0.168f)
@@ -2817,6 +2852,110 @@ jobs:
                   }
               }
           }
+
+          /** Fondo del inicio: resplandor azul, anillos tenues y circuitos en los bordes. */
+          class HudBackground(c: Context) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val d = c.resources.displayMetrics.density
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  p.style = Paint.Style.FILL
+                  p.shader = android.graphics.RadialGradient(
+                      w / 2f, h * 0.30f, h * 0.75f,
+                      intArrayOf(0xFF0B2A52.toInt(), 0xFF061630.toInt(), Neon.BG), floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+                  )
+                  cv.drawRect(0f, 0f, w, h, p)
+                  p.shader = null
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = d
+                  val r = java.util.Random(21)
+                  for (side in 0 until 2) {
+                      for (k in 0 until 9) {
+                          var x = if (side == 0) 0f else w
+                          var y = h * (0.06f + 0.5f * r.nextFloat())
+                          val dir = if (side == 0) 1f else -1f
+                          val path = Path()
+                          path.moveTo(x, y)
+                          x += dir * d * (14f + r.nextInt(40))
+                          path.lineTo(x, y)
+                          y += d * (16f + r.nextInt(70)) * (if (r.nextBoolean()) 1f else -1f)
+                          path.lineTo(x, y)
+                          x += dir * d * (8f + r.nextInt(26))
+                          path.lineTo(x, y)
+                          p.color = (Neon.CYAN and 0xFFFFFF) or (0x4A shl 24)
+                          cv.drawPath(path, p)
+                          p.style = Paint.Style.FILL
+                          cv.drawCircle(x, y, d * 2f, p)
+                          p.style = Paint.Style.STROKE
+                      }
+                  }
+                  for (k in 0 until 3) {
+                      val rr = w * (0.52f + 0.16f * k)
+                      p.color = (Neon.CYAN and 0xFFFFFF) or (0x1C shl 24)
+                      cv.drawCircle(w / 2f, h * 0.30f, rr, p)
+                  }
+              }
+          }
+
+          /** Ondas de sonido: se mueven con su voz al escuchar y con las palabras de Cerberus al hablar. */
+          class WaveView(c: Context, private val leftSide: Boolean) : View(c) {
+              var state: String = "idle"
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val d = c.resources.displayMetrics.density
+              private val bars = 9
+              private val ph = FloatArray(bars) { it * 1.7f }
+              private val sp = FloatArray(bars) { 3.5f + (it * 7 % 5) * 1.1f }
+              private var tt = 0f
+              private var e = 0.1f
+              private var last = 0L
+
+              private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                  duration = 1000
+                  repeatCount = ValueAnimator.INFINITE
+                  addUpdateListener {
+                      val now = System.nanoTime()
+                      val dt = if (last == 0L) 0.016f else ((now - last) / 1e9f).coerceIn(0f, 0.05f)
+                      last = now
+                      tt += dt
+                      val kick = if (Bus.kickAt == 0L) 0f else Math.exp((-((now - Bus.kickAt) / 1e9f) * 6f).toDouble()).toFloat()
+                      val target = when (state) {
+                          "speaking" -> maxOf(0.3f + 0.15f * sin(tt * 9f), 0.25f + 0.75f * kick)
+                          "thinking" -> 0.45f + 0.15f * sin(tt * 5f)
+                          "listening" -> 0.12f + 0.88f * Bus.level
+                          else -> 0.1f
+                      }
+                      e += (target - e) * 0.3f
+                      invalidate()
+                  }
+              }
+
+              override fun onAttachedToWindow() { super.onAttachedToWindow(); last = 0L; anim.start() }
+              override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
+
+              override fun onDraw(cv: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val gap = w / bars
+                  val col = if (state == "thinking") 0xFFFFB347.toInt() else Neon.CYAN
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  for (i in 0 until bars) {
+                      val pos = if (leftSide) i / (bars - 1f) else 1f - i / (bars - 1f)
+                      val env = 0.3f + 0.7f * pos
+                      val wob = 0.35f + 0.65f * Math.abs(sin(tt * sp[i] + ph[i]))
+                      val hh = (h * 0.12f + h * 0.8f * e * env * wob).coerceAtMost(h * 0.95f)
+                      val x = gap * (i + 0.5f)
+                      p.strokeWidth = d * 5f
+                      p.color = (col and 0xFFFFFF) or (0x30 shl 24)
+                      cv.drawLine(x, h / 2f - hh / 2f, x, h / 2f + hh / 2f, p)
+                      p.strokeWidth = d * 2.2f
+                      p.color = col
+                      cv.drawLine(x, h / 2f - hh / 2f, x, h / 2f + hh / 2f, p)
+                  }
+              }
+          }
           CERBEOF
           mkdir -p app/src/main/java/com/carlosart/cerberus
           cat > app/src/main/java/com/carlosart/cerberus/NeuralView.kt <<'CERBEOF'
@@ -2825,20 +2964,25 @@ jobs:
           import android.animation.ValueAnimator
           import android.content.Context
           import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.LinearGradient
           import android.graphics.Paint
+          import android.graphics.RadialGradient
+          import android.graphics.RectF
+          import android.graphics.Shader
           import android.view.View
           import kotlin.math.cos
           import kotlin.math.exp
+          import kotlin.math.hypot
           import kotlin.math.max
           import kotlin.math.min
-          import kotlin.math.roundToInt
           import kotlin.math.sin
           import kotlin.random.Random
 
           /**
-           * Red neuronal en anillos concéntricos que giran lentamente en sentidos opuestos.
-           * Los impulsos nacen en el anillo interior y viajan hacia afuera.
-           * - Hablando: cada palabra de Cerberus lanza una ráfaga.
+           * Cerebro holográfico hecho de neuronas y conexiones, con impulsos que viajan por la red,
+           * aro orbital, haz de luz y plataforma retroiluminada.
+           * - Hablando: cada palabra de Cerberus lanza una ráfaga de impulsos.
            * - Escuchando: la intensidad sigue el volumen de su voz.
            * - Pensando: actividad rápida y constante en ámbar.
            */
@@ -2846,29 +2990,109 @@ jobs:
 
               var state: String = "idle"
 
-              private val counts = intArrayOf(16, 24, 32, 42, 54, 66)
-              private val fracs = floatArrayOf(0.26f, 0.38f, 0.50f, 0.64f, 0.79f, 0.94f)
-              private val rings = counts.size
-              private val n = counts.sum()
-              private val ringStart = IntArray(rings)
-              private val ringOf = IntArray(n)
-              private val idxOf = IntArray(n)
-              private val scale = FloatArray(n)
-              private val ang = FloatArray(rings)
-              private val ea = ArrayList<Int>()
-              private val eb = ArrayList<Int>()
+              // contorno del cerebro (vista lateral) y tronco, en coordenadas 0..1
+              private val cere = floatArrayOf(
+                  0.06f, 0.52f, 0.08f, 0.38f, 0.15f, 0.25f, 0.27f, 0.14f, 0.42f, 0.08f, 0.58f, 0.07f,
+                  0.73f, 0.11f, 0.85f, 0.20f, 0.93f, 0.33f, 0.95f, 0.46f, 0.92f, 0.58f, 0.85f, 0.66f,
+                  0.86f, 0.74f, 0.78f, 0.82f, 0.66f, 0.84f, 0.60f, 0.78f, 0.52f, 0.72f, 0.40f, 0.70f,
+                  0.28f, 0.72f, 0.17f, 0.68f, 0.09f, 0.62f
+              )
+              private val stem = floatArrayOf(0.46f, 0.70f, 0.56f, 0.70f, 0.57f, 0.86f, 0.54f, 0.97f, 0.47f, 0.97f, 0.44f, 0.86f)
+
+              private class Mesh(
+                  val x: FloatArray, val y: FloatArray, val z: FloatArray,
+                  val ea: IntArray, val eb: IntArray
+              )
+
+              private fun inside(poly: FloatArray, x: Float, y: Float): Boolean {
+                  var ins = false
+                  val m = poly.size / 2
+                  var j = m - 1
+                  for (i in 0 until m) {
+                      val xi = poly[2 * i]
+                      val yi = poly[2 * i + 1]
+                      val xj = poly[2 * j]
+                      val yj = poly[2 * j + 1]
+                      if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) ins = !ins
+                      j = i
+                  }
+                  return ins
+              }
+
+              private fun buildMesh(): Mesh {
+                  val rnd = Random(11)
+                  val xs = ArrayList<Float>()
+                  val ys = ArrayList<Float>()
+                  val zs = ArrayList<Float>()
+                  fun addPt(x: Float, y: Float, minD: Float) {
+                      for (k in xs.indices) {
+                          val dx = xs[k] - x
+                          val dy = ys[k] - y
+                          if (dx * dx + dy * dy < minD * minD) return
+                      }
+                      xs.add(x)
+                      ys.add(y)
+                      zs.add((rnd.nextFloat() - 0.5f) * 0.5f)
+                  }
+                  for (poly in listOf(cere, stem)) {
+                      val m = poly.size / 2
+                      for (i in 0 until m) {
+                          val x1 = poly[2 * i]
+                          val y1 = poly[2 * i + 1]
+                          val x2 = poly[2 * ((i + 1) % m)]
+                          val y2 = poly[2 * ((i + 1) % m) + 1]
+                          val steps = max(1, (hypot(x2 - x1, y2 - y1) / 0.045f).toInt())
+                          for (s in 0 until steps) {
+                              val t = s / steps.toFloat()
+                              addPt(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, 0.025f)
+                          }
+                      }
+                  }
+                  var tries = 0
+                  while (tries < 9000 && xs.size < 270) {
+                      tries++
+                      val x = rnd.nextFloat()
+                      val y = rnd.nextFloat()
+                      if (inside(cere, x, y) || inside(stem, x, y)) addPt(x, y, 0.04f)
+                  }
+                  val n = xs.size
+                  val seen = HashSet<Int>()
+                  val ea = ArrayList<Int>()
+                  val eb = ArrayList<Int>()
+                  for (i in 0 until n) {
+                      val near = (0 until n).filter { it != i }.sortedBy {
+                          val dx = xs[it] - xs[i]
+                          val dy = ys[it] - ys[i]
+                          dx * dx + dy * dy
+                      }.take(4)
+                      for (j in near) {
+                          if (hypot(xs[j] - xs[i], ys[j] - ys[i]) > 0.11f) continue
+                          if (seen.add(min(i, j) * n + max(i, j))) {
+                              ea.add(i); eb.add(j)
+                              ea.add(j); eb.add(i)
+                          }
+                      }
+                  }
+                  return Mesh(xs.toFloatArray(), ys.toFloatArray(), zs.toFloatArray(), ea.toIntArray(), eb.toIntArray())
+              }
+
+              private val mesh = buildMesh()
+              private val n = mesh.x.size
+              private val ea = mesh.ea
+              private val eb = mesh.eb
               private val from = Array(n) { ArrayList<Int>() }
-              private val inputEdges = ArrayList<Int>()
-              private val px = FloatArray(n)
-              private val py = FloatArray(n)
+              private val sx = FloatArray(n)
+              private val sy = FloatArray(n)
+              private val sd = FloatArray(n)
+              private val col = IntArray(n)
               private val glow = FloatArray(n)
-              private val nodeCol = IntArray(n)
               private val hsv = FloatArray(3)
 
               private class Pulse(var e: Int, var p: Float, var sp: Float)
 
               private val pulses = ArrayList<Pulse>()
               private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val rect = RectF()
               private val dens = c.resources.displayMetrics.density
               private var last = 0L
               private var tt = 0f
@@ -2876,58 +3100,39 @@ jobs:
               private var spawnAcc = 0f
               private var lastKick = 0L
 
+              private val shCyan = RadialGradient(0f, 0f, 1f, intArrayOf(0xFF2EE6FF.toInt(), 0x002EE6FF), floatArrayOf(0f, 1f), Shader.TileMode.CLAMP)
+              private val shBlue = RadialGradient(0f, 0f, 1f, intArrayOf(0xFF2F6BFF.toInt(), 0x002F6BFF), floatArrayOf(0f, 1f), Shader.TileMode.CLAMP)
+              private val shAmber = RadialGradient(0f, 0f, 1f, intArrayOf(0xFFFFB347.toInt(), 0x00FFB347), floatArrayOf(0f, 1f), Shader.TileMode.CLAMP)
+
+              // partículas que suben por el haz
+              private val partX = FloatArray(26)
+              private val partPh = FloatArray(26)
+              private val partSp = FloatArray(26)
+
               private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
                   duration = 1000
                   repeatCount = ValueAnimator.INFINITE
                   addUpdateListener { step(); invalidate() }
               }
 
-              private fun addEdge(a: Int, b: Int): Int {
-                  ea.add(a)
-                  eb.add(b)
-                  from[a].add(ea.size - 1)
-                  return ea.size - 1
-              }
-
               init {
-                  var k = 0
-                  for (r in 0 until rings) {
-                      ringStart[r] = k
-                      for (i in 0 until counts[r]) {
-                          ringOf[k] = r
-                          idxOf[k] = i
-                          scale[k] = 0.7f + Random.nextFloat() * 0.8f
-                          k++
-                      }
-                      ang[r] = r * 0.7f
-                  }
-                  for (r in 0 until rings) {
-                      val cnt = counts[r]
-                      for (i in 0 until cnt) {
-                          val a = ringStart[r] + i
-                          addEdge(a, ringStart[r] + (i + 1) % cnt)
-                          if (r < rings - 1) {
-                              val nc = counts[r + 1]
-                              val j = (i * nc / cnt.toFloat()).roundToInt()
-                              val e1 = addEdge(a, ringStart[r + 1] + j % nc)
-                              val e2 = addEdge(a, ringStart[r + 1] + (j + 1) % nc)
-                              if (r == 0) {
-                                  inputEdges.add(e1)
-                                  inputEdges.add(e2)
-                              }
-                          }
-                      }
+                  for (e in ea.indices) from[ea[e]].add(e)
+                  val r = Random(3)
+                  for (i in partX.indices) {
+                      partX[i] = r.nextFloat() * 2f - 1f
+                      partPh[i] = r.nextFloat()
+                      partSp[i] = 0.12f + r.nextFloat() * 0.18f
                   }
               }
 
               override fun onAttachedToWindow() { super.onAttachedToWindow(); last = 0L; anim.start() }
               override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
 
-              private fun speed(): Float = 0.9f + energy * 2.0f + Random.nextFloat() * 0.6f
+              private fun speed(): Float = 0.9f + energy * 2.2f + Random.nextFloat() * 0.6f
 
               private fun spawn() {
-                  if (pulses.size >= 200) return
-                  val e = inputEdges[Random.nextInt(inputEdges.size)]
+                  if (pulses.size >= 220 || ea.isEmpty()) return
+                  val e = Random.nextInt(ea.size)
                   glow[ea[e]] = 0.9f
                   pulses.add(Pulse(e, 0f, speed()))
               }
@@ -2943,20 +3148,15 @@ jobs:
                       "speaking" -> max(0.35f + 0.12f * sin(tt * 9f), 0.3f + 0.7f * kickE)
                       "thinking" -> 0.75f
                       "listening" -> 0.18f + 0.8f * Bus.level
-                      else -> 0.1f
+                      else -> 0.12f
                   }
                   if (Bus.kickAt != lastKick) {
                       lastKick = Bus.kickAt
-                      if (state == "speaking") repeat(6) { spawn() }
+                      if (state == "speaking") repeat(8) { spawn() }
                   }
+                  for (i in 0 until n) glow[i] = max(0f, glow[i] - dt * 1.8f)
 
-                  for (r in 0 until rings) {
-                      val dir = if (r % 2 == 0) 1f else -1f
-                      ang[r] += dir * (0.06f + 0.025f * r) * (1f + 2.5f * energy) * dt
-                  }
-                  for (i in 0 until n) glow[i] = max(0f, glow[i] - dt * 2.0f)
-
-                  spawnAcc += energy * 34f * dt
+                  spawnAcc += (3f + energy * 40f) * dt
                   while (spawnAcc >= 1f) {
                       spawnAcc -= 1f
                       spawn()
@@ -2972,8 +3172,8 @@ jobs:
                           glow[b] = 1f
                           iter.remove()
                           val out = from[b]
-                          if (out.isNotEmpty() && pulses.size + born.size < 200 &&
-                              Random.nextFloat() < 0.55f + 0.4f * energy
+                          if (out.isNotEmpty() && pulses.size + born.size < 220 &&
+                              Random.nextFloat() < 0.6f + 0.35f * energy
                           ) {
                               born.add(Pulse(out[Random.nextInt(out.size)], 0f, speed()))
                           }
@@ -2982,77 +3182,227 @@ jobs:
                   pulses.addAll(born)
               }
 
-              /** Matiz RGB de cada neurona: recorre el arcoíris y gira despacio; al pensar se limita a tonos cálidos. */
-              private fun hueColor(k: Int): Int {
-                  val r = ringOf[k]
-                  var h = (360f * idxOf[k] / counts[r] + r * 47f + tt * 24f) % 360f
-                  if (state == "thinking") h = 20f + h / 360f * 40f
-                  hsv[0] = h
-                  hsv[1] = 0.72f
-                  hsv[2] = 1f
-                  return android.graphics.Color.HSVToColor(hsv)
-              }
-
               private fun alpha(c: Int, a: Int) = (a.coerceIn(0, 255) shl 24) or (c and 0xFFFFFF)
 
+              private fun glowEllipse(cv: Canvas, cx: Float, cy: Float, rx: Float, ry: Float, sh: Shader, a: Int) {
+                  paint.style = Paint.Style.FILL
+                  paint.color = Color.WHITE
+                  paint.alpha = a.coerceIn(0, 255)
+                  paint.shader = sh
+                  cv.save()
+                  cv.translate(cx, cy)
+                  cv.scale(rx, ry)
+                  cv.drawCircle(0f, 0f, 1f, paint)
+                  cv.restore()
+                  paint.shader = null
+              }
+
+              private fun hueColor(i: Int, hub: Boolean): Int {
+                  val u = mesh.x[i]
+                  var h = 195f + 95f * u + 14f * sin(tt * 0.6f + i * 0.7f)
+                  if (hub) h += 35f
+                  if (state == "thinking") h = 24f + (h - 195f) / 95f * 22f
+                  hsv[0] = h % 360f
+                  hsv[1] = if (hub) 0.55f else 0.72f
+                  hsv[2] = 1f
+                  return Color.HSVToColor(hsv)
+              }
+
+              private fun ring(cv: Canvas, cx: Float, cy: Float, rx: Float, ry: Float, front: Boolean, phi: Float, base: Int) {
+                  cv.save()
+                  cv.translate(cx, cy)
+                  cv.rotate(-14f)
+                  rect.set(-rx, -ry, rx, ry)
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeCap = Paint.Cap.ROUND
+                  if (front) {
+                      paint.strokeWidth = dens * 7f
+                      paint.color = alpha(base, 45)
+                      cv.drawArc(rect, 0f, 180f, false, paint)
+                      paint.strokeWidth = dens * 2.2f
+                      paint.color = alpha(0xFFFFFF, 235)
+                      cv.drawArc(rect, 0f, 180f, false, paint)
+                  } else {
+                      paint.strokeWidth = dens * 1.2f
+                      paint.color = alpha(base, 110)
+                      cv.drawArc(rect, 180f, 180f, false, paint)
+                  }
+                  val ex = rx * cos(phi)
+                  val ey = ry * sin(phi)
+                  if ((ey > 0f) == front) {
+                      paint.style = Paint.Style.FILL
+                      paint.color = alpha(base, 90)
+                      cv.drawCircle(ex, ey, dens * 7f, paint)
+                      paint.color = alpha(0xFFFFFF, 255)
+                      cv.drawCircle(ex, ey, dens * 2.6f, paint)
+                  }
+                  cv.restore()
+              }
+
               override fun onDraw(cv: Canvas) {
-                  val col = when (state) {
+                  val base = when (state) {
                       "thinking" -> 0xFFFFB347.toInt()
                       "speaking" -> 0xFF7DF9FF.toInt()
                       else -> 0xFF2EC4FF.toInt()
                   }
-                  val core = if (state == "thinking") 0xFFFFEBCF.toInt() else 0xFFEAFFFF.toInt()
-                  val cx = width / 2f
-                  val cy = height / 2f
-                  val big = min(cx, cy) - dens * 6f
+                  val sh = if (state == "thinking") shAmber else shCyan
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val bw = min(w * 0.74f, h * 0.66f * 1.15f)
+                  val bh = bw * 0.92f
+                  val cx = w / 2f
+                  val top = h * 0.03f
+                  val cy = top + bh / 2f
+                  val pcy = h * 0.88f
+                  val prx = w * 0.40f
+                  val pry = prx * 0.2f
+                  val pulse = 0.5f + 0.5f * sin(tt * 2.2f)
 
-                  for (k in 0 until n) {
-                      val r = ringOf[k]
-                      val a = ang[r] + 2f * Math.PI.toFloat() * idxOf[k] / counts[r]
-                      val rad = big * fracs[r] * (1f + 0.025f * sin(tt * 1.2f + k) + 0.03f * energy)
-                      px[k] = cx + rad * cos(a)
-                      py[k] = cy + rad * sin(a)
-                      nodeCol[k] = hueColor(k)
+                  // --- anillos HUD giratorios detrás del cerebro ---
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeCap = Paint.Cap.BUTT
+                  for (k in 0 until 2) {
+                      val rr = bw * (0.70f + 0.13f * k)
+                      rect.set(cx - rr, cy - rr, cx + rr, cy + rr)
+                      paint.strokeWidth = dens * (1.1f + 0.6f * k)
+                      paint.color = alpha(base, (40 + 60 * energy).toInt())
+                      val rot = tt * (if (k == 0) 12f else -8f)
+                      for (s in 0 until 14) cv.drawArc(rect, rot + s * (360f / 14f), 14f, false, paint)
                   }
 
-                  // brillo suave en el centro vacío
+                  // --- resplandor del volumen del cerebro y retroiluminación de la plataforma ---
+                  glowEllipse(cv, cx, cy, bw * 0.66f, bh * 0.62f, if (state == "thinking") shAmber else shBlue, (55 + 120 * energy).toInt())
+                  glowEllipse(cv, cx, pcy, prx * 1.3f, pry * 2.6f, sh, (60 + 80 * pulse + 90 * energy).toInt())
+
+                  // --- haz de luz ---
+                  val beamTop = cy + bh * 0.40f
+                  val bt = bw * 0.07f
+                  val bb = prx * 0.55f
+                  val path = android.graphics.Path()
+                  path.moveTo(cx - bt, beamTop)
+                  path.lineTo(cx + bt, beamTop)
+                  path.lineTo(cx + bb, pcy)
+                  path.lineTo(cx - bb, pcy)
+                  path.close()
                   paint.style = Paint.Style.FILL
-                  for (i in 0 until 6) {
-                      paint.color = alpha(col, (5 + 22 * energy).toInt())
-                      cv.drawCircle(cx, cy, big * 0.27f * (1f - i / 6f), paint)
+                  paint.color = Color.WHITE
+                  paint.shader = LinearGradient(0f, beamTop, 0f, pcy, 0x002EE6FF, alpha(base, 255), Shader.TileMode.CLAMP)
+                  paint.alpha = (70 + 70 * pulse + 70 * energy).toInt().coerceIn(0, 255)
+                  cv.drawPath(path, paint)
+                  paint.shader = null
+
+                  // partículas subiendo por el haz
+                  for (i in partX.indices) {
+                      val t = (partPh[i] + tt * partSp[i] * (1f + energy)) % 1f
+                      val yy = pcy - t * (pcy - beamTop)
+                      val half = bb + (bt - bb) * t
+                      val xx = cx + partX[i] * half * 0.85f
+                      val a = sin(Math.PI.toFloat() * t)
+                      paint.color = alpha(0xFFFFFF, (200 * a).toInt())
+                      cv.drawCircle(xx, yy, dens * 1.3f, paint)
+                  }
+
+                  // --- plataforma ---
+                  val wall = dens * 9f
+                  paint.style = Paint.Style.FILL
+                  paint.color = 0xFF04101F.toInt()
+                  rect.set(cx - prx, pcy - pry + wall, cx + prx, pcy + pry + wall)
+                  cv.drawOval(rect, paint)
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeWidth = dens * 2f
+                  paint.color = 0xFF0E4A7A.toInt()
+                  cv.drawOval(rect, paint)
+                  paint.style = Paint.Style.FILL
+                  paint.color = 0xFF071B33.toInt()
+                  rect.set(cx - prx, pcy - pry, cx + prx, pcy + pry)
+                  cv.drawOval(rect, paint)
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeWidth = dens * 7f
+                  paint.color = alpha(base, 40)
+                  cv.drawOval(rect, paint)
+                  paint.strokeWidth = dens * 2.2f
+                  paint.color = alpha(base, (170 + 70 * pulse).toInt())
+                  cv.drawOval(rect, paint)
+                  for (f in floatArrayOf(0.84f, 0.62f)) {
+                      rect.set(cx - prx * f, pcy - pry * f, cx + prx * f, pcy + pry * f)
+                      paint.strokeWidth = dens * 1.3f
+                      paint.color = alpha(base, (110 + 60 * energy).toInt())
+                      cv.drawOval(rect, paint)
+                  }
+                  rect.set(cx - prx * 0.73f, pcy - pry * 0.73f, cx + prx * 0.73f, pcy + pry * 0.73f)
+                  paint.strokeWidth = dens * 2.4f
+                  paint.color = alpha(0xFFFFFF, 200)
+                  val rot = tt * (30f + 80f * energy)
+                  for (s in 0 until 12) cv.drawArc(rect, rot + s * 30f, 14f, false, paint)
+                  rect.set(cx - prx * 0.93f, pcy - pry * 0.93f, cx + prx * 0.93f, pcy + pry * 0.93f)
+                  paint.strokeWidth = dens * 2.2f
+                  paint.color = 0xFFFFC107.toInt()
+                  cv.drawArc(rect, 200f, 26f, false, paint)
+                  cv.drawArc(rect, 314f, 26f, false, paint)
+                  glowEllipse(cv, cx, pcy, prx * 0.55f, pry * 0.55f, sh, (130 + 70 * pulse + 80 * energy).toInt())
+
+                  // --- aro orbital (parte trasera) ---
+                  val orx = bw * 0.68f
+                  val ory = bw * 0.15f
+                  val ocy = cy + bh * 0.06f
+                  val phi = tt * (0.9f + 1.2f * energy)
+                  ring(cv, cx, ocy, orx, ory, false, phi, base)
+
+                  // --- cerebro: posiciones con giro suave en 3D ---
+                  val yaw = 0.38f * sin(tt * 0.45f)
+                  val cs = cos(yaw)
+                  val sn = sin(yaw)
+                  val breathe = 1f + 0.014f * sin(tt * 1.5f) + 0.025f * energy
+                  for (i in 0 until n) {
+                      val u = mesh.x[i] - 0.5f
+                      val v = mesh.y[i] - 0.5f
+                      val z = mesh.z[i]
+                      val ux = u * cs + z * sn
+                      val depth = -u * sn + z * cs
+                      sx[i] = cx + ux * bw * breathe
+                      sy[i] = cy + v * bh * breathe + dens * 1.2f * sin(tt * 1.1f + i)
+                      sd[i] = (0.85f + depth * 0.9f).coerceIn(0.55f, 1.25f)
+                      col[i] = hueColor(i, i % 8 == 0)
                   }
 
                   paint.style = Paint.Style.STROKE
-                  paint.strokeWidth = dens * 0.8f
-                  for (e in ea.indices) {
+                  paint.strokeCap = Paint.Cap.ROUND
+                  paint.strokeWidth = dens * 0.7f
+                  var e = 0
+                  while (e < ea.size) {
                       val a = ea[e]
                       val b = eb[e]
-                      val sameRing = ringOf[a] == ringOf[b]
-                      paint.color = alpha(nodeCol[a], ((if (sameRing) 40 else 56) + 70 * energy).toInt())
-                      cv.drawLine(px[a], py[a], px[b], py[b], paint)
+                      val df = (sd[a] + sd[b]) / 2f
+                      paint.color = alpha(col[a], (28 + 50 * df + 80 * energy).toInt())
+                      cv.drawLine(sx[a], sy[a], sx[b], sy[b], paint)
+                      e += 2
                   }
 
                   paint.style = Paint.Style.FILL
                   for (p in pulses) {
                       val a = ea[p.e]
                       val b = eb[p.e]
-                      val x = px[a] + (px[b] - px[a]) * p.p
-                      val y = py[a] + (py[b] - py[a]) * p.p
-                      paint.color = alpha(nodeCol[a], 90)
-                      cv.drawCircle(x, y, dens * 3.6f, paint)
-                      paint.color = alpha(core, 255)
-                      cv.drawCircle(x, y, dens * 1.4f, paint)
+                      val x = sx[a] + (sx[b] - sx[a]) * p.p
+                      val y = sy[a] + (sy[b] - sy[a]) * p.p
+                      paint.color = alpha(col[a], 100)
+                      cv.drawCircle(x, y, dens * 4f, paint)
+                      paint.color = alpha(0xFFFFFF, 255)
+                      cv.drawCircle(x, y, dens * 1.3f, paint)
                   }
 
-                  for (k in 0 until n) {
-                      val f = fracs[ringOf[k]]
-                      val g = glow[k]
-                      val s = scale[k]
-                      paint.color = alpha(nodeCol[k], (50 + 100 * g).toInt())
-                      cv.drawCircle(px[k], py[k], dens * (s * (1.5f + 1.8f * f) + 4.5f * g), paint)
-                      paint.color = alpha(nodeCol[k], (200 + 55 * g).toInt())
-                      cv.drawCircle(px[k], py[k], dens * (s * (0.55f + 1.0f * f) + 1.4f * g), paint)
+                  for (i in 0 until n) {
+                      val hub = i % 8 == 0
+                      val g = glow[i]
+                      val df = sd[i]
+                      val r = dens * (if (hub) 2.3f else 1.3f) * df
+                      paint.color = alpha(col[i], (40 + 110 * g + (if (hub) 40 else 0)).toInt())
+                      cv.drawCircle(sx[i], sy[i], r * (2.4f + 2.6f * g), paint)
+                      paint.color = alpha(if (hub) 0xFFFFFF else col[i], (190 + 65 * g).toInt())
+                      cv.drawCircle(sx[i], sy[i], r + dens * 1.2f * g, paint)
                   }
+
+                  // --- aro orbital (parte delantera) ---
+                  ring(cv, cx, ocy, orx, ory, true, phi, base)
               }
           }
           CERBEOF
@@ -3993,10 +4343,10 @@ jobs:
       - name: Nombrar el APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/Cerberus-v10.1.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/Cerberus-v11.1.apk
 
       - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
-          name: Cerberus-v10.1
-          path: dist/Cerberus-v10.1.apk
+          name: Cerberus-v11.1
+          path: dist/Cerberus-v11.1.apk
